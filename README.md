@@ -1,151 +1,187 @@
-# BOSGAME M5 DUAL CLUSTER AI SERVER
-Setup scripts to install on two AMD Strix Halo 128gb PCS (Bosgame M5) to serve AI models on the local, trusted LAN for Windows 11 developers to access.
+# Strix Halo Cluster
+
+Yet another setup process for a 2-PC AMD Strix Halo cluster. 
+
+In this instance, two AMD Strix Halo 128GB PCs (Bosgame M5) nodes linked over USB4 as a private AI cluster hosting Qwen3.8-Flash-Next for up to three users. In addition, ComfyUI and a system-monitor dashboard can also be installed.
 
 ## Features
 
-### vLLM + Ray + Open WebUI
-- Multiple nodes connected through USB4NET
-- Models hosted by vLLM
-- Models distrubuted across nodes using Ray
-- Model occupancy load balanced and managed by residencyd 
-- Model files shared on a single SSD folder share via NFS
-- Front-end provided by OpenWebUI
-- Additional Gradio Dashboard to manage model catalog and use
+- Turnkey scripts. Start with a fresh Ubuntu install and the scripts handle all the rest.
+- Cluster linked over USB4 (~8Gbps) for Strix Hao machines lacking 10Gbps Ethernet (like the Bosgame M5). USB4 data cable required. I use https://link.amazon/B03prmZHS
+- Qwen3.8-Flash-Next can be configured to use 4, 5 or 6 bit quantization and different context window sizes. What works for you depends on your needs. To host up to 3 simulatious sessions, I'm using Q4 and 512ki context windows. 
+- ComfyUI is setup on both nodes so two users can use it at once, but they share a common folder location so all models only need to be downloaded once to use on either node in the cluster.
+- Both nodes provide remote desktop services and share an 'xfer' folder on the network for ease of maintenance from Windows clients.
+- Qwen3.8-Flash-Next sessions served by the cluster have been tested from Windows clients using Open WebUI in a web broswer, [AnythingLLM](https://anythingllm.com/) on the desktop, VSCode [extensions](https://marketplace.visualstudio.com/items?itemName=AndrewButson.github-copilot-llm-gateway) and custom tools using the Copilot SDK.
 
+### Caveats
 
-Models that fit on one M5 can run locally on either node. Models requiring more memory can run across both nodes using vLLM + Ray + RCCL.
+This is all configured for a trusted, private LAN environment. No security measures are taken beyond basic firewall settings and disabling Wifi/Bluetooth radios. This is not a configuration to expose to the internet or public networks.
 
-1. Final Architecture
-                    Windows 11 LAN
-                          │
-             ┌────────────┴────────────┐
-             │                         │
-        Open WebUI              Copilot SDK Apps
-             │                         │
-             └────────────┬────────────┘
-                          │
-                    llm-gateway
-                  M5-A LAN :8000
-                          │
-                    residencyd
-                  Unix socket only
-                          │
-              ┌───────────┴───────────┐
-              │                       │
-             M5-A                    M5-B
-       Ryzen AI Max+ 395       Ryzen AI Max+ 395
-          128 GB UMA              128 GB UMA
-              │                       │
-              └══════ USB4NET ════════┘
-                    10.44.0.0/30
-                  Ray + RCCL + NFS
+The XFCE desktop installed for Ubuntu is bare-bones and ugly, but uses very little GPU & memory. I chose this to keep as many resources free for the AI models as possible.
 
+## Architecture
 
-2. User-facing result
-                 BOSGAME AI CLUSTER
+### LLM inference
 
-Open WebUI ───────┐
-                  │
-Copilot SDK ──────┼──► llm-gateway
-                  │         │
-Other API apps ───┘         ▼
-                       residencyd
-                            │
-                  ┌─────────┴─────────┐
-                  ▼                   ▼
-                M5-A ═══ USB4NET ═══ M5-B
-                  │                   │
-                  └──── vLLM/Ray ─────┘
+```mermaid
+graph LR
+    clients["LAN clients"] --> web["Nginx :80<br/>Open WebUI + /v1"]
+    web --> llama["Controller llama-server<br/>Qwen3.8-Flash-Next"]
+    model["Model files<br/>/srv/models/..."] --> llama
+    llama -->|Private USB4 RPC :50053| rpc["Worker ggml-rpc-server"]
+```
 
-### ComfyUI
+The controller serves the LAN API and coordinates inference; the worker provides remote GPU layers over `usb4llm0` (`10.200.0.0/30`).
 
-- All models and downloads shared on a single SSD folder
-    download once, use on any cluster node.
-- Each cluster node provides a seperate ComfyUI server to use.
-    allows parallel users
+### ComfyUI and shared storage
 
-### Management
+```mermaid
+graph LR
+    clients["LAN clients"] --> comfy_a["Controller ComfyUI<br/>:8188"]
+    clients --> comfy_b["Worker ComfyUI<br/>:8188"]
+    comfy_a -->|local| store["Controller NFS store<br/>/srv/comfyui :2049"]
+    comfy_b -->|NFS over USB4| store
+```
 
-- Gradio Dashboard for vLLM model monitoring and maintenance
-    simple fetch of new models from HuggingFave and ModelScope
-    automatic catalog entries
-    easy load/evict/add/delete controls
-- Network Folder share on each node for file moving ('xfer' folders)
-- Remote desktop support for Windows 11 clients
+Both nodes run ComfyUI. The controller owns the shared store and exports it to the worker over the private link. Samba file transfer and XRDP run on each node but are omitted from these focused diagrams.
 
-### Dashboard development
+## Requirements
 
-- `dashboard/dashboard.py` contains the Gradio dashboard mounted at
-  `http://server:8000/dashboard`; `dashboard/restart-dashboard.sh` is the
-  server-node helper for installing an edited copy and restarting only
-  `llm-gateway.service`.
-- Model details includes a live Operation progress panel with state, phase,
-  target node, elapsed time, residencyd/vLLM log tails, and load/unload errors.
-  The download tab continuously polls the `llm-pull.service` journal while a
-  model download is active.
-- `setup-strixhalo-ai-server.sh` still installs FastAPI, Uvicorn, httpx and
-  Gradio, and copies `dashboard/dashboard.py` into the gateway virtualenv
-  during initial provisioning. Transfer the setup script and all companion
-  source subfolders (`gateway/`, `dashboard/`, `llmprofile/`, and
-  `residency/`) together for that first install.
-- To iterate, edit `dashboard/dashboard.py` locally, copy the updated
-  `dashboard/` folder to the server, then run
-  `sudo bash ./dashboard/restart-dashboard.sh`.
-  The helper also accepts a dashboard source path and honors `GATEWAY_VENV`.
-  Alternatively, install the file into the gateway virtualenv and run
-  `sudo systemctl restart llm-gateway.service`. Do not rerun provisioning.
+- Ubuntu 26.04.1 or later on both nodes, with `apt` and `systemd`
+- Two nodes connected by USB4 and reachable by their LAN hostnames
+- An unprivileged Linux account on each node; use matching UID/GID values for the shared ComfyUI store
+- Sufficient local storage for the selected model and the peer RPC cache
+- A trusted LAN: the default Samba share is anonymous and read/write
 
-### Gateway development
+The default Q4 plan needs about 110 GiB for the model. Q5 and Q6 need about 150 GiB and 160 GiB respectively and are experimental on this two-node topology. Set `HF_TOKEN` before the controller setup if Hugging Face authentication is required.
 
-- `gateway/app.py` is the canonical gateway source. Initial setup installs it
-  as `$GATEWAY_VENV/app.py` (normally `/opt/llm-gateway/app.py`), and the systemd
-  unit imports it from that virtualenv working directory.
-- To iterate, edit or copy the `gateway/` folder to the server, then run
-  `sudo bash ./gateway/restart-gateway.sh`. The helper atomically replaces
-  only `app.py` and restarts only `llm-gateway.service`; it does not rerun
-  provisioning or change `dashboard.py` or dependencies. It accepts an
-  optional source path and honors `GATEWAY_VENV`/`GATEWAY_SOURCE`.
+## Quick start
 
-### Model profiling development
+Copy all scripts to the Ubuntu machines and run. Replace the placeholders and use the same Linux account and quantization on both nodes. Remember, reboots may be required before services are active. If you monitor with the included dashboard you'll see it may take a few minutes for the cluster to report itself as 'Healthy'. Some of the services need time to connect and establish their links. 
 
-- `llmprofile/llm-profile.py` is the standard-library-only source installed as
-  `/usr/local/bin/llm-profile`.
-- To iterate, edit or copy the `llmprofile/` folder to the node, then run
-  `sudo bash ./llmprofile/update-llm-profile.sh`. It atomically updates only
-  the CLI, restarts no service, and leaves the model catalog untouched.
-  `LLM_PROFILE_DEST` and an optional source path are supported.
+For these scripts, one machine is the 'server' and the other is the 'peer'. The server is the box your users will connect to.
+Copy the same scripts to both machines, but be sure to run them with the correct parameters on each machine.
+Some scripts have more options if you want to customize the setup further.
 
-### Residency control-plane development
+```bash
+# 1. Base environment: run on both nodes. Must be done first.
+# Run on the server first, then the peer using the proper --role settings for each
+sudo bash setup-environment.sh --role server --user <linux-user>  # server
+sudo bash setup-environment.sh --role peer --user <linux-user>    # peer
 
-- `residency/residencyd.py` is the server-node root daemon and
-  `residency/residency-agent.py` is the peer-side USB4-only HTTP agent. They
-  are standard-library-only canonical sources; initial provisioning requires
-  the `residency/` folder beside `setup-strixhalo-ai-server.sh`, which installs
-  them in `/usr/local/lib/llm-cluster` (or the configured `RESIDENCY_LIB`).
-- To iterate, edit the source files locally, copy the `residency/` folder to
-  the node, then run `sudo bash ./residency/restart-residency.sh`. Running it
-  on the server restarts `residencyd.service`; running it on the peer restarts
-  `residency-agent.service`. An optional source-directory argument and the
-  `RESIDENCY_LIB` environment override are supported. The source-directory
-  argument is not required when both Python files are beside the helper; it is
-  only for storing the source files elsewhere. The helper reloads systemd unit
-  definitions before restarting the service.
-- Test edits one node at a time as appropriate. The helper only replaces the
-  residency sources and restarts the installed residency service; it does not
-  rerun provisioning or alter the model catalog/configuration.
+# 2. After reboot you can verify both nodes (be sure USB4 cable is connected)
+sudo bash verify-environment.sh  # server
+sudo bash verify-environment.sh  # peer
 
-### VSCode
+# 3. Distributed Qwen3.8: run on the server first, then the peer using the proper --role settings for each
+sudo bash setup-qwen3d8.sh --role server --user <linux-user> --quant Q4 --context 256 --skip-foundation # server
+sudo bash setup-qwen3d8.sh --role peer --user <linux-user> --quant Q4 --context 256 --skip-foundation   # peer
 
-- VSCode of vLLM models supported through https://github.com/arbs-io/github-copilot-llm-gateway
+# 4. Optional ComfyUI: run on the server first, then the peer using the proper --role settings for each
+sudo bash setup-comfyui.sh --server <controller-host> --peer <worker-host> --role server --user <linux-user>    # server
+sudo bash setup-comfyui.sh --server <controller-host> --peer <worker-host> --role peer --user <linux-user>      # peer
 
-## Installation
+# 5. Optional dashboard: run on the server first, then the peer using the proper --role settings for each
+sudo bash dashboard/setup-dashboard.sh --role server --dashboard-host 0.0.0.0   # server
+sudo bash dashboard/setup-dashboard.sh --role peer  # peer
+```
 
-- Simple, idempotent setup script to run on each node. setup-strixhalo-ai-server.sh
-- The container runtime is checked for the pinned vLLM/Ray pair (vLLM 0.22.1
-  with Ray 2.48.0 by default). Setup resolves the base image to an immutable
-  digest and automatically builds a local compatibility overlay when the base
-  image carries a different Ray version. It then verifies the actual runtime
-  versions before creating the Ray services. Override
-  `VLLM_EXPECTED_VERSION` and `RAY_EXPECTED_VERSION` only for a tested pair.
-- Post-setup verification script after reboot: verify-and-seed-strixhalo-ai-server.sh
-- List of models to seed system with: strixhalo-models.txt
+The controller downloads the model and serves the API; the worker provides the USB4 RPC service. If you skip the preliminary environment step, omit `--skip-foundation` from `setup-qwen3d8.sh` and let that script run it.
+
+For three Q4 slots with an extended 512 Ki context window, replace
+`--context 256` with `--context 512` in both Qwen setup commands. The
+installer automatically configures 2x YaRN scaling and the required temporary
+GGUF metadata override; run the capacity test and long-context quality checks
+before using the extended window in production.
+
+## Scripts
+
+| Script | Purpose |
+| --- | --- |
+| `setup-environment.sh` | Base node setup: USB4, Samba file drop, XRDP, and UFW |
+| `setup-comfyui.sh` | ComfyUI on each node with an NFS-shared model/data store |
+| `setup-qwen3d8.sh` | ROCm, `llama.cpp`, Qwen3.8 model, RPC services, and controller web UI |
+| `verify-environment.sh` | Checks services, networking, firewall rules, and USB4 throughput |
+| `dashboard/` | Independent telemetry agent, Python test runner, Gradio dashboard, and dashboard-only installer |
+
+## Services and defaults
+
+- USB4: `usb4llm0`, controller `10.200.0.1`, worker `10.200.0.2`
+- RPC worker: private TCP port `50053`
+- Qwen3.8: Q4, three parallel slots, 192 Ki tokens per slot by default; use `--context 256` for the native 256 Ki window, or `--context 512` for Q4 with automatic 2x YaRN scaling
+- Open WebUI and OpenAI-compatible API: `http://<controller>/` and `http://<controller>:80/v1`
+- Cluster dashboard: `http://<controller>:7860` after installing `dashboard/setup-dashboard.sh`
+- ComfyUI: `http://<node>:8188`
+- Windows file drop: `\\<node>\xfer`; XRDP: `<node>:3389`
+- XRDP redirected Windows drives: `~/thinclient_drives` inside the remote session
+
+All scripts are designed to be rerun safely. Use `--help` for the complete option list, review any `Action required` messages, and use `sudo qwen3d8-status` or `sudo usb4-cluster-status` for diagnostics.
+
+The dashboard is maintained separately from the provisioning scripts. See
+[`dashboard/README.md`](dashboard/README.md) for its installation, telemetry
+agent, configurable capacity tests, persistent token-rate statistics,
+command-line tests, and Gradio controls.
+
+The Qwen installer installs both the GPU-targeted ROCm runtime and the matching
+ROCm core development package. The latter supplies HIP's CMake package, which
+is required to build llama.cpp; installing only the runtime package is
+insufficient.
+
+## Windows file transfer through XRDP
+
+XRDP supports Windows drive redirection and file clipboard transfer through its
+`xrdp-chansrv` channel server and FUSE. Xorg provides the remote display and
+Xfce provides the desktop; neither prevents file transfer. The installer
+enables the `rdpdr` and `cliprdr` channels, installs FUSE, and mounts selected
+Windows drives under `~/thinclient_drives`.
+
+With the built-in Windows client (`mstsc.exe`):
+
+1. Select **Show Options** before connecting.
+2. On **Local Resources**, leave **Clipboard** selected.
+3. Select **More...**, expand **Drives**, and select the Windows drives to share.
+4. Connect using the configured Linux account.
+5. In the Xfce file manager, open **Home** and then `thinclient_drives`. The
+   selected drives appear there, usually as `C on <Windows-PC>` and similar.
+
+Drive redirection must be selected before the RDP session starts. Direct
+drag-and-drop from a local Windows Explorer window onto an Xfce window is not
+provided by XRDP; use the redirected drive or copy/paste between file-manager
+windows. If the drives are not visible, disconnect and reconnect after
+selecting them, then check `sudo bash verify-environment.sh --skip-throughput`
+and the per-session `xrdp-chansrv` log under `~/.local/share/xrdp/`.
+
+The SMB maintenance share remains available as a simpler fallback:
+`\\<node>\xfer`. It does not depend on an active XRDP session and is useful
+when Windows policy disables RDP drive redirection.
+
+## Concurrent physical and XRDP logins
+
+Modern Ubuntu installs `dbus-user-session`, which permits one graphical
+session per Linux account. A user logged in at the physical console can
+therefore see a black screen or a failed XRDP login when the same account is
+used remotely.
+
+The default installer session is XFCE. It starts the XRDP XFCE session with
+its own D-Bus bus by clearing `DBUS_SESSION_BUS_ADDRESS` before launching
+`dbus-launch`, while preserving `XDG_RUNTIME_DIR` for `systemd --user`,
+terminals, and desktop applications. This allows a best-effort separate local
+and remote session without sharing the physical desktop. Rerun
+`setup-environment.sh` on each node and reconnect after applying the change.
+
+These are separate desktops: XRDP does not attach to or mirror the physical
+console session. Some applications and `systemctl --user` services still
+assume one graphical session. GNOME is not a reliable choice for this
+arrangement; use the managed XFCE session or a separate Linux account for
+reliable maintenance access. Pass `--no-concurrent-local` to retain the
+standard single-session behavior.
+
+---  
+  
+>If you enjoy this project, please consider:
+
+<a href="https://www.buymeacoffee.com/mighty_studios" target="_blank">
+  <img src="https://cdn.buymeacoffee.com/buttons/default-yellow.png" alt="Buy Me A Coffee" height="41" width="174">
+</a>
+
+<small>(The joy I get from a free latte is incredible)</small> 

@@ -9,6 +9,7 @@
 
 # Github
 .github/
+-.github/FUNDING.yml
 
 # Editor / OS noise
 .vs/
@@ -23,3 +24,9 @@ Desktop.ini
 # GoPilot and TurboPilot (my own tools)
 .GoPilot/
 .TurboPilot/
+
+# Dashboard runtime artifacts
+dashboard/__pycache__/
+dashboard/*.pyc
+dashboard/*.sqlite3
+dashboard/*.sqlite3-*
