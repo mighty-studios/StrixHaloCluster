@@ -7,10 +7,6 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/main/Dotnet.gitignore
 
-# Github
-.github/
--.github/FUNDING.yml
-
 # Editor / OS noise
 .vs/
 .vscode/

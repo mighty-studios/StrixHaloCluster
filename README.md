@@ -1,23 +1,23 @@
 # Strix Halo Cluster
 
-Yet another setup process for a 2-PC AMD Strix Halo cluster. 
+Yet another setup process for a two-PC AMD Strix Halo cluster.
 
-In this instance, two AMD Strix Halo 128GB PCs (Bosgame M5) nodes linked over USB4 as a private AI cluster hosting Qwen3.8-Flash-Next for up to three users. In addition, ComfyUI and a system-monitor dashboard can also be installed.
+This instance uses two 128 GB AMD Strix Halo PCs (Bosgame M5 nodes) linked over USB4 as a private AI cluster hosting Qwen3.8-Flash-Next for up to three concurrent inference slots. ComfyUI and a system monitoring dashboard can also be installed.
 
 ## Features
 
 - Turnkey scripts. Start with a fresh Ubuntu install and the scripts handle all the rest.
-- Cluster linked over USB4 (~8Gbps) for Strix Hao machines lacking 10Gbps Ethernet (like the Bosgame M5). USB4 data cable required. I use https://link.amazon/B03prmZHS
-- Qwen3.8-Flash-Next can be configured to use 4, 5 or 6 bit quantization and different context window sizes. What works for you depends on your needs. To host up to 3 simulatious sessions, I'm using Q4 and 512ki context windows. 
-- ComfyUI is setup on both nodes so two users can use it at once, but they share a common folder location so all models only need to be downloaded once to use on either node in the cluster.
-- Both nodes provide remote desktop services and share an 'xfer' folder on the network for ease of maintenance from Windows clients.
-- Qwen3.8-Flash-Next sessions served by the cluster have been tested from Windows clients using Open WebUI in a web broswer, [AnythingLLM](https://anythingllm.com/) on the desktop, VSCode [extensions](https://marketplace.visualstudio.com/items?itemName=AndrewButson.github-copilot-llm-gateway) and custom tools using the Copilot SDK.
+- The tested Bosgame M5 nodes are linked over USB4. The verifier targets at least 8 Gbit/s over the private link. A USB4 data cable is required. I use https://link.amazon/B03prmZHS
+- Qwen3.8-Flash-Next supports the Q4, Q5, and Q6 quantization presets and different context window sizes. To host up to three concurrent inference sessions, I use Q4 with 512 Ki tokens per slot.
+- ComfyUI is set up on both nodes. Each node runs its own ComfyUI instance, and both use a shared model/data store so models only need to be downloaded once for use on either node.
+- Both nodes provide remote desktop services and each exposes an anonymous, read/write `xfer` folder on the network for maintenance from Windows clients.
+- Qwen3.8-Flash-Next sessions served by the cluster have been tested from Windows clients using Open WebUI in a web browser, [AnythingLLM](https://anythingllm.com/) on the desktop, VS Code [extensions](https://marketplace.visualstudio.com/items?itemName=AndrewButson.github-copilot-llm-gateway), and custom tools using the Copilot SDK.
 
 ### Caveats
 
-This is all configured for a trusted, private LAN environment. No security measures are taken beyond basic firewall settings and disabling Wifi/Bluetooth radios. This is not a configuration to expose to the internet or public networks.
+This is all configured for a trusted, private LAN environment. No security measures are taken beyond basic firewall settings and disabling Wi-Fi/Bluetooth radios. This is not a configuration to expose to the internet or public networks.
 
-The XFCE desktop installed for Ubuntu is bare-bones and ugly, but uses very little GPU & memory. I chose this to keep as many resources free for the AI models as possible.
+The XFCE desktop installed for Ubuntu is bare-bones and ugly, but uses very little GPU and memory. I chose this to keep as many resources free for the AI models as possible.
 
 ## Architecture
 
@@ -47,13 +47,13 @@ Both nodes run ComfyUI. The controller owns the shared store and exports it to t
 
 ## Requirements
 
-- Ubuntu 26.04.1 or later on both nodes, with `apt` and `systemd`
+- Ubuntu 26.04.1 or later is the tested baseline on both nodes. The installers require `apt-get` and `systemd`.
 - Two nodes connected by USB4 and reachable by their LAN hostnames
 - An unprivileged Linux account on each node; use matching UID/GID values for the shared ComfyUI store
 - Sufficient local storage for the selected model and the peer RPC cache
 - A trusted LAN: the default Samba share is anonymous and read/write
 
-The default Q4 plan needs about 110 GiB for the model. Q5 and Q6 need about 150 GiB and 160 GiB respectively and are experimental on this two-node topology. Set `HF_TOKEN` before the controller setup if Hugging Face authentication is required.
+The installer planning estimates are 110 GiB for Q4, 150 GiB for Q5, and 160 GiB for Q6. For a fresh download, allow roughly 129 GiB, 173 GiB, and 183 GiB of free space respectively because the installer reserves 25 GiB during download. The peer also needs space for its RPC cache. Q5 and Q6 are experimental on this two-node topology. If Hugging Face authentication is required, set `HF_TOKEN` and preserve it through `sudo`, for example: `sudo --preserve-env=HF_TOKEN bash setup-qwen3d8.sh ...`.
 
 ## Quick start
 
@@ -88,7 +88,7 @@ sudo bash dashboard/setup-dashboard.sh --role peer  # peer
 
 The controller downloads the model and serves the API; the worker provides the USB4 RPC service. If you skip the preliminary environment step, omit `--skip-foundation` from `setup-qwen3d8.sh` and let that script run it.
 
-For three Q4 slots with an extended 512 Ki context window, replace
+For three Q4 slots with an extended 512 Ki-token-per-slot context, replace
 `--context 256` with `--context 512` in both Qwen setup commands. The
 installer automatically configures 2x YaRN scaling and the required temporary
 GGUF metadata override; run the capacity test and long-context quality checks
@@ -108,8 +108,8 @@ before using the extended window in production.
 
 - USB4: `usb4llm0`, controller `10.200.0.1`, worker `10.200.0.2`
 - RPC worker: private TCP port `50053`
-- Qwen3.8: Q4, three parallel slots, 192 Ki tokens per slot by default; use `--context 256` for the native 256 Ki window, or `--context 512` for Q4 with automatic 2x YaRN scaling
-- Open WebUI and OpenAI-compatible API: `http://<controller>/` and `http://<controller>:80/v1`
+- Qwen3.8: Q4, three parallel inference slots, 192 Ki tokens per slot by default; use `--context 256` for the native 256 Ki tokens per slot, or `--context 512` for Q4 with automatic 2x YaRN scaling
+- Open WebUI and OpenAI-compatible API: `http://<controller>/` and `http://<controller>:80/v1/`
 - Cluster dashboard: `http://<controller>:7860` after installing `dashboard/setup-dashboard.sh`
 - ComfyUI: `http://<node>:8188`
 - Windows file drop: `\\<node>\xfer`; XRDP: `<node>:3389`
@@ -129,11 +129,11 @@ insufficient.
 
 ## Windows file transfer through XRDP
 
-XRDP supports Windows drive redirection and file clipboard transfer through its
-`xrdp-chansrv` channel server and FUSE. Xorg provides the remote display and
-Xfce provides the desktop; neither prevents file transfer. The installer
-enables the `rdpdr` and `cliprdr` channels, installs FUSE, and mounts selected
-Windows drives under `~/thinclient_drives`.
+XRDP supports Windows drive redirection and clipboard transfer through its
+`xrdp-chansrv` channel server. Xorg provides the remote display and Xfce
+provides the desktop. FUSE is used for redirected-drive mounts, not clipboard
+transfer. The installer enables the `rdpdr` and `cliprdr` channels, installs
+FUSE, and mounts selected Windows drives under `~/thinclient_drives`.
 
 With the built-in Windows client (`mstsc.exe`):
 
@@ -157,10 +157,10 @@ when Windows policy disables RDP drive redirection.
 
 ## Concurrent physical and XRDP logins
 
-Modern Ubuntu installs `dbus-user-session`, which permits one graphical
-session per Linux account. A user logged in at the physical console can
-therefore see a black screen or a failed XRDP login when the same account is
-used remotely.
+On Ubuntu systems using `dbus-user-session`, same-user physical-console and
+XRDP sessions can conflict because they may share D-Bus session state. A user
+logged in at the physical console can therefore see a black screen or a failed
+XRDP login when the same account is used remotely.
 
 The default installer session is XFCE. It starts the XRDP XFCE session with
 its own D-Bus bus by clearing `DBUS_SESSION_BUS_ADDRESS` before launching
@@ -176,9 +176,9 @@ arrangement; use the managed XFCE session or a separate Linux account for
 reliable maintenance access. Pass `--no-concurrent-local` to retain the
 standard single-session behavior.
 
----  
-  
->If you enjoy this project, please consider:
+---
+
+> If you enjoy this project, please consider:
 
 <a href="https://www.buymeacoffee.com/mighty_studios" target="_blank">
   <img src="https://cdn.buymeacoffee.com/buttons/default-yellow.png" alt="Buy Me A Coffee" height="41" width="174">
