@@ -127,3 +127,5 @@ The dashboard also includes a **Cancel running test** control and an in-memory
 **Clear error log** control. The error log is in-memory. Cancellation is cooperative for inference tests and
 terminates an active USB4 `iperf3` subprocess. The error log records telemetry
 errors, failed assertions, warnings, and cancellation requests.
+
+![sample dashboard](./dashboard.png)

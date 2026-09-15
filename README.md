@@ -19,6 +19,9 @@ This is all configured for a trusted, private LAN environment. No security measu
 
 The XFCE desktop installed for Ubuntu is bare-bones and ugly, but uses very little GPU and memory. I chose this to keep as many resources free for the AI models as possible.
 
+### Sample Dashboard
+![sample dashboard](./dashboard/dashboard.png)
+
 ## Architecture
 
 ### LLM inference
