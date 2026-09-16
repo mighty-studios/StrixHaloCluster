@@ -108,6 +108,17 @@ class PeerConfigurationTests(unittest.TestCase):
 
 
 class DashboardCapacityTests(unittest.TestCase):
+    def test_capacity_activity_is_limited_to_requested_slot_ids(self) -> None:
+        slots = [
+            {"id": 0, "is_processing": True, "n_ctx": 262144},
+            {"id": 1, "is_processing": True, "n_ctx": 262144},
+            {"id": 2, "is_processing": True, "n_ctx": 262144},
+        ]
+
+        selected = cluster_tests._capacity_test_slots(slots, target_parallel=1)
+
+        self.assertEqual([slot["id"] for slot in selected], [0])
+
     def test_capacity_wrapper_accepts_runner_progress(self) -> None:
         app = cluster_dashboard.DashboardApp({})
 
@@ -129,7 +140,7 @@ class DashboardCapacityTests(unittest.TestCase):
         cancel_event = threading.Event()
         expected = cluster_dashboard.TestResult("capacity", True)
         with patch.object(
-            cluster_dashboard, "capacity_test", return_value=expected
+            cluster_dashboard, "capacity_test_series", return_value=expected
         ) as capacity:
             result = execute(
                 {"llama_url": "http://127.0.0.1:8081"},
@@ -141,14 +152,91 @@ class DashboardCapacityTests(unittest.TestCase):
         capacity.assert_called_once_with(
             {"llama_url": "http://127.0.0.1:8081"},
             context_tokens=196608,
+            input_tokens=None,
             output_tokens=1,
             parallel=3,
+            warmup=True,
+            repetitions=3,
             cancel_event=cancel_event,
             progress=runner_progress,
         )
 
 
+class DashboardRestartTests(unittest.TestCase):
+    def test_restart_starts_restricted_helper(self) -> None:
+        app = cluster_dashboard.DashboardApp({"role": "server"})
+        completed = subprocess.CompletedProcess(
+            args=["systemctl"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        with (
+            patch.object(
+                cluster_dashboard.subprocess, "run", return_value=completed
+            ) as run,
+            patch.object(
+                app,
+                "refresh",
+                return_value=("status", "history", "errors", "details"),
+            ),
+        ):
+            response = app.restart_server()
+
+        self.assertTrue(response[0].startswith("[PASS]"))
+        run.assert_called_once_with(
+            ["systemctl", "start", "qwen3d8-server-restart.service"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def test_restart_refuses_while_test_is_running(self) -> None:
+        app = cluster_dashboard.DashboardApp({"role": "server"})
+        app._active_test = "capacity test"
+        with patch.object(
+            app,
+            "refresh",
+            return_value=("status", "history", "errors", "details"),
+        ):
+            response = app.restart_server()
+
+        self.assertTrue(response[0].startswith("[FAIL]"))
+        self.assertIn("capacity test is running", response[0])
+
+
 class InstalledConfigurationTests(unittest.TestCase):
+    def test_renders_latest_capacity_parameters(self) -> None:
+        rendered = cluster_dashboard.render_token_history(
+            {
+                "windows": [],
+                "latest": {
+                    "test_name": "Capacity test",
+                    "recorded_at_iso": "2026-09-15T07:00:00+00:00",
+                    "details": {
+                        "parameters": {
+                            "context_tokens": 262144,
+                            "input_tokens": 260000,
+                            "output_tokens": 2048,
+                            "parallel_slots": 3,
+                            "safety_margin_tokens": 96,
+                            "timeout_seconds": 14400,
+                        }
+                    },
+                },
+            }
+        )
+
+        self.assertIn("## Capacity test results", rendered)
+        self.assertIn(
+            "**Parameters:** context 262,144 tokens/slot  |  "
+            "input 260,000 tokens  |  output 2,048 tokens  |  "
+            "parallel 3 slots  |  safety margin 96 tokens  |  "
+            "timeout 240 min",
+            rendered,
+        )
+
     def test_renders_installed_qwen_settings(self) -> None:
         rendered = cluster_dashboard.render_installed_configuration(
             {
@@ -186,7 +274,127 @@ class InstalledConfigurationTests(unittest.TestCase):
         )
 
 
+class CapacityTimeoutTests(unittest.TestCase):
+    def test_default_timeout_scales_with_workload(self) -> None:
+        timeout = cluster_tests._capacity_timeout(
+            {},
+            input_tokens=524288,
+            output_tokens=0,
+            parallel_slots=3,
+        )
+
+        self.assertEqual(timeout, 14400)
+
+    def test_explicit_timeout_overrides_automatic_timeout(self) -> None:
+        timeout = cluster_tests._capacity_timeout(
+            {"capacity_timeout": 7200},
+            input_tokens=524288,
+            output_tokens=0,
+            parallel_slots=3,
+        )
+
+        self.assertEqual(timeout, 7200)
+
+    def test_capacity_series_reports_median_and_excludes_warmup(self) -> None:
+        summaries = iter(
+            [
+                {
+                    "prompt_tokens_per_second": 10.0,
+                    "generation_tokens_per_second": 20.0,
+                    "aggregate_tokens_per_second": 15.0,
+                    "wall_seconds": 4.0,
+                },
+                {
+                    "prompt_tokens_per_second": 30.0,
+                    "generation_tokens_per_second": 40.0,
+                    "aggregate_tokens_per_second": 35.0,
+                    "wall_seconds": 2.0,
+                },
+                {
+                    "prompt_tokens_per_second": 20.0,
+                    "generation_tokens_per_second": 30.0,
+                    "aggregate_tokens_per_second": 25.0,
+                    "wall_seconds": 3.0,
+                },
+                {
+                    "prompt_tokens_per_second": 40.0,
+                    "generation_tokens_per_second": 50.0,
+                    "aggregate_tokens_per_second": 45.0,
+                    "wall_seconds": 1.0,
+                },
+            ]
+        )
+
+        def fake_capacity_test(*args: object, **kwargs: object) -> cluster_tests.TestResult:
+            summary = next(summaries)
+            return cluster_tests.TestResult(
+                "capacity",
+                True,
+                details={
+                    "parameters": {
+                        "context_tokens": 73824,
+                        "input_tokens": 65536,
+                        "output_tokens": 8192,
+                        "parallel_slots": 1,
+                    },
+                    "token_rate_summary": summary,
+                    "token_metrics": [],
+                },
+            )
+
+        with patch.object(cluster_tests, "capacity_test", side_effect=fake_capacity_test):
+            result = cluster_tests.capacity_test_series(
+                {"metrics_db": ""},
+                warmup=True,
+                repetitions=3,
+            )
+
+        self.assertTrue(result.ok, result.render())
+        self.assertEqual(
+            result.details["median"]["prompt_tokens_per_second"], 30.0
+        )
+        self.assertEqual(
+            result.details["median"]["generation_tokens_per_second"], 40.0
+        )
+        self.assertEqual(len(result.details["samples"]), 3)
+
+
 class DashboardConfigurationTests(unittest.TestCase):
+    def test_preserves_smaller_timing_defaults_over_installed_capacity(self) -> None:
+        cluster_environment = {
+            "NODE_ROLE": "server",
+            "PARALLEL_SLOTS": "3",
+            "CONTEXT_PER_SLOT": "524288",
+        }
+        dashboard_config = (
+            '{"capacity_test_input_tokens":65536,'
+            '"capacity_test_context_tokens":73824,'
+            '"capacity_test_output_tokens":8192,'
+            '"capacity_test_parallel_slots":1,'
+            '"capacity_test_warmup":true,'
+            '"capacity_test_repetitions":3}'
+        )
+        with (
+            patch.object(
+                cluster_monitor,
+                "parse_env_file",
+                side_effect=[cluster_environment, {}],
+            ),
+            patch.object(
+                cluster_monitor.Path,
+                "read_text",
+                return_value=dashboard_config,
+            ),
+        ):
+            config = cluster_monitor.load_config("/etc/qwen3d8/dashboard.json")
+
+        self.assertEqual(config["capacity_test_input_tokens"], 65536)
+        self.assertEqual(config["capacity_test_context_tokens"], 73824)
+        self.assertEqual(config["capacity_test_output_tokens"], 8192)
+        self.assertEqual(config["capacity_test_parallel_slots"], 1)
+        self.assertTrue(config["capacity_test_warmup"])
+        self.assertEqual(config["capacity_test_repetitions"], 3)
+
     def test_loads_yarn_settings_from_cluster_environment(self) -> None:
         cluster_environment = {
             "NODE_ROLE": "server",

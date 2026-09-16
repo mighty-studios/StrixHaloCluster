@@ -19,6 +19,8 @@ CONFIG_FILE="${CONFIG_FILE:-$CONFIG_ROOT/dashboard.json}"
 SERVICE_USER="${SERVICE_USER:-qwen-dashboard}"
 VENV="${VENV:-$APP_ROOT/venv}"
 METRICS_DB="${METRICS_DB:-/var/lib/$SERVICE_USER/token-rates.sqlite3}"
+SERVER_RESTART_UNIT="${SERVER_RESTART_UNIT:-qwen3d8-server-restart.service}"
+SERVER_RESTART_POLKIT_RULE="${SERVER_RESTART_POLKIT_RULE:-/etc/polkit-1/rules.d/49-qwen3d8-dashboard-restart.rules}"
 
 CLUSTER_ENV="${CLUSTER_ENV:-/etc/qwen3d8/cluster.env}"
 USB4_ENV="${USB4_ENV:-/etc/default/usb4-cluster}"
@@ -30,8 +32,12 @@ LLAMA_PORT="${LLAMA_PORT:-8081}"
 IPERF_PORT="${IPERF_PORT:-5201}"
 PARALLEL_SLOTS="${PARALLEL_SLOTS:-3}"
 CONTEXT_PER_SLOT="${CONTEXT_PER_SLOT:-262144}"
-CAPACITY_TEST_OUTPUT_TOKENS="${CAPACITY_TEST_OUTPUT_TOKENS:-2048}"
+CAPACITY_TEST_OUTPUT_TOKENS="${CAPACITY_TEST_OUTPUT_TOKENS:-8192}"
 CAPACITY_TEST_SAFETY_MARGIN="${CAPACITY_TEST_SAFETY_MARGIN:-96}"
+CAPACITY_TEST_INPUT_TOKENS="${CAPACITY_TEST_INPUT_TOKENS:-65536}"
+CAPACITY_TEST_PARALLEL_SLOTS="${CAPACITY_TEST_PARALLEL_SLOTS:-1}"
+CAPACITY_TEST_REPETITIONS="${CAPACITY_TEST_REPETITIONS:-3}"
+CAPACITY_TEST_WARMUP="${CAPACITY_TEST_WARMUP:-1}"
 
 BOLD=$'\e[1m'
 RED=$'\e[31m'
@@ -64,7 +70,11 @@ Options:
   --lan-nets "<cidrs>"       Networks allowed to reach the dashboard
   --auth-user <name>         Optional Gradio basic-auth username
   --auth-password-file <p>   File containing the optional Gradio password
+  --test-input <tokens>      Capacity-test prompt input tokens (default: $CAPACITY_TEST_INPUT_TOKENS)
   --test-output <tokens>     Capacity-test generated tokens (default: $CAPACITY_TEST_OUTPUT_TOKENS)
+  --test-parallel <slots>    Capacity-test concurrent slots (default: $CAPACITY_TEST_PARALLEL_SLOTS)
+  --test-repetitions <n>     Measured capacity-test repetitions (default: $CAPACITY_TEST_REPETITIONS)
+  --test-no-warmup           Disable the capacity-test warmup request
   --test-safety-margin <n>   Tokens reserved below the configured context (default: $CAPACITY_TEST_SAFETY_MARGIN)
   --metrics-db <path>        SQLite token-rate history path (default: $METRICS_DB)
   -h, --help                 Show this help
@@ -134,10 +144,28 @@ while [ "$#" -gt 0 ]; do
       AUTH_PASSWORD_FILE="$2"
       shift
       ;;
+    --test-input)
+      need_arg "$1" "${2:-}"
+      CAPACITY_TEST_INPUT_TOKENS="$2"
+      shift
+      ;;
     --test-output)
       need_arg "$1" "${2:-}"
       CAPACITY_TEST_OUTPUT_TOKENS="$2"
       shift
+      ;;
+    --test-parallel)
+      need_arg "$1" "${2:-}"
+      CAPACITY_TEST_PARALLEL_SLOTS="$2"
+      shift
+      ;;
+    --test-repetitions)
+      need_arg "$1" "${2:-}"
+      CAPACITY_TEST_REPETITIONS="$2"
+      shift
+      ;;
+    --test-no-warmup)
+      CAPACITY_TEST_WARMUP=0
       ;;
     --test-safety-margin)
       need_arg "$1" "${2:-}"
@@ -167,9 +195,8 @@ command -v systemctl >/dev/null 2>&1 || die "this installer requires systemd"
   || die "$CLUSTER_ENV is missing; run setup-qwen3d8.sh on this node first"
 
 # The Qwen installer is the source of truth for runtime capacity. The
-# dashboard must never require a second, manually synchronized context value.
-CAPACITY_TEST_CONTEXT_TOKENS="$CONTEXT_PER_SLOT"
-CAPACITY_TEST_PARALLEL_SLOTS="$PARALLEL_SLOTS"
+# dashboard keeps its timing-test workload smaller than the installed capacity.
+CAPACITY_TEST_CONTEXT_TOKENS=""
 EXPECTED_CONTEXT_PER_SLOT="$CONTEXT_PER_SLOT"
 EXPECTED_PARALLEL_SLOTS="$PARALLEL_SLOTS"
 
@@ -187,26 +214,44 @@ done
   || die "parallel slot count must be positive"
 [[ "$CONTEXT_PER_SLOT" =~ ^[0-9]+$ ]] && [ "$CONTEXT_PER_SLOT" -gt 0 ] \
   || die "context per slot must be positive"
-[[ "$CAPACITY_TEST_CONTEXT_TOKENS" =~ ^[0-9]+$ ]] \
-  && [ "$CAPACITY_TEST_CONTEXT_TOKENS" -gt 0 ] \
-  || die "installed context per slot must be positive"
+[[ "$CAPACITY_TEST_INPUT_TOKENS" =~ ^[0-9]+$ ]] \
+  && [ "$CAPACITY_TEST_INPUT_TOKENS" -gt 0 ] \
+  || die "test input token count must be positive"
+[[ "$CAPACITY_TEST_INPUT_TOKENS" =~ ^[0-9]+$ ]] \
+  && [ "$CAPACITY_TEST_INPUT_TOKENS" -le 1048576 ] \
+  || die "test input token count must be at most 1048576"
 [[ "$CAPACITY_TEST_PARALLEL_SLOTS" =~ ^[0-9]+$ ]] \
   && [ "$CAPACITY_TEST_PARALLEL_SLOTS" -ge 1 ] \
-  || die "installed parallel slot count must be positive"
-[[ "$CAPACITY_TEST_CONTEXT_TOKENS" =~ ^[0-9]+$ ]] \
-  && [ "$CAPACITY_TEST_CONTEXT_TOKENS" -gt 0 ] \
-  && [ "$CAPACITY_TEST_CONTEXT_TOKENS" -le 1048576 ] \
-  || die "test context must be between 1 and 1048576 tokens"
+  || die "test parallel slot count must be positive"
 [[ "$CAPACITY_TEST_OUTPUT_TOKENS" =~ ^[0-9]+$ ]] \
-  && [ "$CAPACITY_TEST_OUTPUT_TOKENS" -lt "$CAPACITY_TEST_CONTEXT_TOKENS" ] \
-  || die "test output must be less than the test context"
+  && [ "$CAPACITY_TEST_OUTPUT_TOKENS" -gt 0 ] \
+  || die "test output token count must be positive"
 [[ "$CAPACITY_TEST_SAFETY_MARGIN" =~ ^[0-9]+$ ]] \
-  && [ "$((CAPACITY_TEST_OUTPUT_TOKENS + CAPACITY_TEST_SAFETY_MARGIN))" -lt "$CAPACITY_TEST_CONTEXT_TOKENS" ] \
-  || die "test output plus safety margin must be less than the test context"
+  && [ "$CAPACITY_TEST_SAFETY_MARGIN" -ge 0 ] \
+  || die "test safety margin must not be negative"
+CAPACITY_TEST_CONTEXT_TOKENS=$(
+  printf '%s\n' "$((CAPACITY_TEST_INPUT_TOKENS + CAPACITY_TEST_OUTPUT_TOKENS + CAPACITY_TEST_SAFETY_MARGIN))"
+)
+[[ "$CAPACITY_TEST_CONTEXT_TOKENS" -le 1048576 ]] \
+  || die "test context must be at most 1048576 tokens"
+[[ "$CAPACITY_TEST_CONTEXT_TOKENS" -le "$CONTEXT_PER_SLOT" ]] \
+  || die "test context must not exceed the installed context per slot"
+[[ "$CAPACITY_TEST_INPUT_TOKENS" -lt "$CONTEXT_PER_SLOT" ]] \
+  || die "test input must be less than the installed context per slot"
 [[ "$CAPACITY_TEST_PARALLEL_SLOTS" =~ ^[0-9]+$ ]] \
   && [ "$CAPACITY_TEST_PARALLEL_SLOTS" -ge 1 ] \
   && [ "$CAPACITY_TEST_PARALLEL_SLOTS" -le 32 ] \
   || die "test parallel slots must be between 1 and 32"
+[[ "$CAPACITY_TEST_PARALLEL_SLOTS" -le "$PARALLEL_SLOTS" ]] \
+  || die "test parallel slots must not exceed the installed slot count"
+[[ "$CAPACITY_TEST_REPETITIONS" =~ ^[0-9]+$ ]] \
+  && [ "$CAPACITY_TEST_REPETITIONS" -ge 1 ] \
+  && [ "$CAPACITY_TEST_REPETITIONS" -le 10 ] \
+  || die "test repetitions must be between 1 and 10"
+case "$CAPACITY_TEST_WARMUP" in
+  0|1) ;;
+  *) die "test warmup setting must be 0 or 1" ;;
+esac
 [[ "$LOCAL_IP" =~ ^([0-9]{1,3}[.]){3}[0-9]{1,3}$ ]] || die "invalid local IP: $LOCAL_IP"
 [[ "$PEER_IP" =~ ^([0-9]{1,3}[.]){3}[0-9]{1,3}$ ]] || die "invalid peer IP: $PEER_IP"
 [[ "$DASHBOARD_HOST" =~ ^[A-Za-z0-9:.%-]+$ ]] || die "invalid dashboard host"
@@ -234,7 +279,7 @@ done
 export DEBIAN_FRONTEND=noninteractive
 log "Installing dashboard prerequisites"
 apt-get update -y
-apt-get install -y python3 python3-pip python3-venv ufw
+apt-get install -y polkitd python3 python3-pip python3-venv ufw
 
 if ! getent group "$SERVICE_USER" >/dev/null 2>&1; then
   groupadd --system "$SERVICE_USER"
@@ -304,10 +349,13 @@ cat > "$CONFIG_FILE" <<CONFIG
   "context_per_slot": $CONTEXT_PER_SLOT,
   "expected_parallel_slots": $EXPECTED_PARALLEL_SLOTS,
   "expected_context_per_slot": $EXPECTED_CONTEXT_PER_SLOT,
+  "capacity_test_input_tokens": $CAPACITY_TEST_INPUT_TOKENS,
   "capacity_test_context_tokens": $CAPACITY_TEST_CONTEXT_TOKENS,
   "capacity_test_output_tokens": $CAPACITY_TEST_OUTPUT_TOKENS,
   "capacity_test_parallel_slots": $CAPACITY_TEST_PARALLEL_SLOTS,
   "capacity_test_safety_margin_tokens": $CAPACITY_TEST_SAFETY_MARGIN,
+  "capacity_test_warmup": $([ "$CAPACITY_TEST_WARMUP" = "1" ] && printf true || printf false),
+  "capacity_test_repetitions": $CAPACITY_TEST_REPETITIONS,
   "metrics_db": "$METRICS_DB",
   "dashboard_host": "$DASHBOARD_HOST",
   "dashboard_port": $DASHBOARD_PORT,
@@ -373,9 +421,35 @@ LimitNOFILE=4096
 [Install]
 WantedBy=multi-user.target
 UNIT
+
+  cat > /etc/systemd/system/$SERVER_RESTART_UNIT <<UNIT
+[Unit]
+Description=Controlled Qwen server restart requested by the dashboard
+ConditionPathExists=/etc/systemd/system/qwen3d8-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart qwen3d8-server.service
+UNIT
+
+  install -d -m 0755 /etc/polkit-1/rules.d
+  cat > "$SERVER_RESTART_POLKIT_RULE" <<POLKIT
+// Managed by $SCRIPT_NAME. Allow only the dashboard service to start the
+// dedicated helper; the helper performs the privileged Qwen restart.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "$SERVER_RESTART_UNIT" &&
+        action.lookup("verb") == "start" &&
+        subject.user == "$SERVICE_USER") {
+        return polkit.Result.YES;
+    }
+});
+POLKIT
+  chmod 0644 "$SERVER_RESTART_POLKIT_RULE"
 else
   systemctl disable --now qwen3d8-dashboard.service >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/qwen3d8-dashboard.service
+  rm -f "/etc/systemd/system/$SERVER_RESTART_UNIT" "$SERVER_RESTART_POLKIT_RULE"
 fi
 
 systemctl daemon-reload

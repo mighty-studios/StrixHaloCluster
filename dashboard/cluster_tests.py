@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import sqlite3
+from statistics import median
 import threading
 import time
 from concurrent.futures import (
@@ -44,18 +45,30 @@ except ImportError:
 
 try:
     from .token_metrics import (
+        TokenMetric,
         TokenRateStore,
         metric_as_dict,
         metric_from_response,
     )
 except ImportError:
-    from token_metrics import TokenRateStore, metric_as_dict, metric_from_response
+    from token_metrics import (
+        TokenMetric,
+        TokenRateStore,
+        metric_as_dict,
+        metric_from_response,
+    )
 
 
 TARGET_PARALLEL_SLOTS = 3
 TARGET_CONTEXT_TOKENS = 262144
 DEFAULT_OUTPUT_TOKENS = 2048
 DEFAULT_TEST_SAFETY_MARGIN = 96
+DEFAULT_CAPACITY_INPUT_TOKENS = 65536
+DEFAULT_CAPACITY_OUTPUT_TOKENS = 8192
+DEFAULT_CAPACITY_PARALLEL_SLOTS = 1
+DEFAULT_CAPACITY_REPETITIONS = 3
+DEFAULT_CAPACITY_TIMEOUT_SECONDS = 3600.0
+CAPACITY_TIMEOUT_SAFETY_FACTOR = 2.0
 
 
 @dataclass
@@ -85,6 +98,40 @@ def _warn(result: TestResult, message: str) -> None:
 
 def _info(result: TestResult, message: str) -> None:
     result.lines.append(f"[INFO] {message}")
+
+
+def _capacity_timeout(
+    config: dict[str, Any],
+    input_tokens: int,
+    output_tokens: int,
+    parallel_slots: int,
+) -> float:
+    configured = config.get("capacity_timeout")
+    if configured is not None:
+        return max(60.0, float(configured))
+
+    workload_tokens = (input_tokens + output_tokens) * parallel_slots
+    baseline_tokens = TARGET_CONTEXT_TOKENS * TARGET_PARALLEL_SLOTS
+    scaled_timeout = (
+        DEFAULT_CAPACITY_TIMEOUT_SECONDS
+        * CAPACITY_TIMEOUT_SAFETY_FACTOR
+        * workload_tokens
+        / baseline_tokens
+    )
+    return max(DEFAULT_CAPACITY_TIMEOUT_SECONDS, scaled_timeout)
+
+
+def _capacity_test_slots(
+    slots_body: Any, target_parallel: int
+) -> list[dict[str, Any]]:
+    if not isinstance(slots_body, list):
+        return []
+    test_slot_ids = set(range(target_parallel))
+    return [
+        slot
+        for slot in slots_body
+        if isinstance(slot, dict) and slot.get("id") in test_slot_ids
+    ]
 
 
 def _progress(
@@ -436,32 +483,40 @@ def capacity_test(
     parallel: int | None = None,
     cancel_event: threading.Event | None = None,
     progress: Callable[..., Any] | None = None,
+    record_metrics: bool = True,
 ) -> TestResult:
     base_url = str(config.get("llama_url", "")).rstrip("/")
-    target_context = int(
-        context_tokens
-        if context_tokens is not None
-        else config.get(
-            "capacity_test_context_tokens",
-            config.get("expected_context_per_slot", TARGET_CONTEXT_TOKENS),
-        )
-    )
     output_tokens = int(
         output_tokens
         if output_tokens is not None
-        else config.get("capacity_test_output_tokens", DEFAULT_OUTPUT_TOKENS)
+        else config.get(
+            "capacity_test_output_tokens", DEFAULT_CAPACITY_OUTPUT_TOKENS
+        )
     )
     target_parallel = int(
         parallel
         if parallel is not None
         else config.get(
-            "capacity_test_parallel_slots",
-            config.get("expected_parallel_slots", TARGET_PARALLEL_SLOTS),
+            "capacity_test_parallel_slots", DEFAULT_CAPACITY_PARALLEL_SLOTS
         )
     )
     safety_margin = int(
         config.get("capacity_test_safety_margin_tokens", DEFAULT_TEST_SAFETY_MARGIN)
     )
+    configured_input = config.get("capacity_test_input_tokens")
+    if input_tokens is None and context_tokens is None and configured_input is not None:
+        input_tokens = int(configured_input)
+    target_context = int(
+        context_tokens
+        if context_tokens is not None
+        else config.get("capacity_test_context_tokens", 0)
+    )
+    if target_context <= 0:
+        target_context = (
+            (input_tokens if input_tokens is not None else DEFAULT_CAPACITY_INPUT_TOKENS)
+            + output_tokens
+            + safety_margin
+        )
     result = TestResult(
         f"Capacity test ({_token_context_label(target_context)} per slot, "
         f"{target_parallel} slots)",
@@ -496,6 +551,12 @@ def capacity_test(
         )
         return result
 
+    request_timeout = _capacity_timeout(
+        config,
+        input_tokens,
+        output_tokens,
+        target_parallel,
+    )
     health_status, health_body = http_json(f"{base_url}/health", timeout=5)
     if health_status != 200:
         _fail(result, f"llama-server is not ready: {health_status} {health_body}")
@@ -517,8 +578,6 @@ def capacity_test(
         for slot in range(target_parallel)
     ]
     barrier = threading.Barrier(target_parallel + 1)
-    request_timeout = max(60.0, float(config.get("capacity_timeout", 3600)))
-
     def submit(slot: int) -> tuple[int, int, Any, float]:
         barrier.wait()
         if cancel_event and cancel_event.is_set():
@@ -549,16 +608,17 @@ def capacity_test(
                 break
             slots_status, slots_body = http_json(f"{base_url}/slots", timeout=5)
             if slots_status == 200 and isinstance(slots_body, list):
+                test_slots = _capacity_test_slots(slots_body, target_parallel)
                 active = sum(
                     1
-                    for slot in slots_body
-                    if isinstance(slot, dict) and slot.get("is_processing")
+                    for slot in test_slots
+                    if slot.get("is_processing")
                 )
                 maximum_active = max(maximum_active, active)
                 observed_contexts = [
                     int(slot["n_ctx"])
-                    for slot in slots_body
-                    if isinstance(slot, dict) and isinstance(slot.get("n_ctx"), int)
+                    for slot in test_slots
+                    if isinstance(slot.get("n_ctx"), int)
                 ]
                 elapsed = time.monotonic() - test_started
                 _progress(
@@ -715,13 +775,22 @@ def capacity_test(
         "output_tokens": output_tokens,
         "target_context": target_context,
         "parallel": target_parallel,
+        "safety_margin_tokens": safety_margin,
+        "parameters": {
+            "context_tokens": target_context,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "parallel_slots": target_parallel,
+            "safety_margin_tokens": safety_margin,
+            "timeout_seconds": request_timeout,
+        },
         "maximum_active_slots": maximum_active,
         "observed_contexts": observed_contexts,
         "token_metrics": [metric_as_dict(metric) for metric in token_metrics],
         "token_rate_summary": aggregate_rates,
     }
     metrics_db = str(config.get("metrics_db", ""))
-    if metrics_db and token_metrics:
+    if record_metrics and metrics_db and token_metrics:
         try:
             TokenRateStore(metrics_db).record_run(
                 token_metrics,
@@ -730,12 +799,214 @@ def capacity_test(
                 parallel_slots=target_parallel,
                 wall_seconds=test_wall_seconds,
                 success=result.ok,
-                details=aggregate_rates,
+                details={
+                    **aggregate_rates,
+                    "parameters": {
+                        "context_tokens": target_context,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "parallel_slots": target_parallel,
+                        "safety_margin_tokens": safety_margin,
+                        "timeout_seconds": request_timeout,
+                    },
+                },
             )
             _info(result, f"token-rate metrics persisted to {metrics_db}")
         except (OSError, sqlite3.Error) as exc:
             _warn(result, f"could not persist token-rate metrics: {exc}")
-    elif not metrics_db:
+    elif record_metrics and not metrics_db:
+        _warn(result, "token-rate metrics are not persisted; metrics_db is not configured")
+    return result
+
+
+def _median_rate(summaries: list[dict[str, Any]], key: str) -> float | None:
+    values = [
+        float(summary[key])
+        for summary in summaries
+        if isinstance(summary, dict)
+        and isinstance(summary.get(key), (int, float))
+    ]
+    return float(median(values)) if values else None
+
+
+def capacity_test_series(
+    config: dict[str, Any],
+    context_tokens: int | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    parallel: int | None = None,
+    warmup: bool = True,
+    repetitions: int = DEFAULT_CAPACITY_REPETITIONS,
+    cancel_event: threading.Event | None = None,
+    progress: Callable[..., Any] | None = None,
+) -> TestResult:
+    """Run an optional warmup followed by repeated measurements."""
+
+    try:
+        repetitions = int(repetitions)
+    except (TypeError, ValueError):
+        repetitions = DEFAULT_CAPACITY_REPETITIONS
+    result = TestResult(
+        f"Capacity timing test (median of {repetitions} measurements)",
+        True,
+    )
+    if repetitions < 1:
+        _fail(result, f"measurement repetitions must be positive, got {repetitions}")
+        return result
+
+    effective_context_tokens = context_tokens
+    if effective_context_tokens is None and input_tokens is not None:
+        effective_output_tokens = (
+            output_tokens
+            if output_tokens is not None
+            else int(
+                config.get(
+                    "capacity_test_output_tokens",
+                    DEFAULT_CAPACITY_OUTPUT_TOKENS,
+                )
+            )
+        )
+        effective_safety_margin = int(
+            config.get(
+                "capacity_test_safety_margin_tokens",
+                DEFAULT_TEST_SAFETY_MARGIN,
+            )
+        )
+        effective_context_tokens = (
+            int(input_tokens) + int(effective_output_tokens) + effective_safety_margin
+        )
+
+    warmup_result: TestResult | None = None
+    measured_results: list[TestResult] = []
+    cycle_count = repetitions + (1 if warmup else 0)
+
+    def run_cycle(index: int, label: str) -> TestResult:
+        def child_progress(value: float, desc: str = "") -> None:
+            _progress(
+                progress,
+                (index + value) / cycle_count,
+                f"{label}: {desc}",
+            )
+
+        return capacity_test(
+            config,
+            context_tokens=effective_context_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            parallel=parallel,
+            cancel_event=cancel_event,
+            progress=child_progress,
+            record_metrics=False,
+        )
+
+    cycle_index = 0
+    if warmup:
+        warmup_result = run_cycle(cycle_index, "Warmup")
+        cycle_index += 1
+        result.lines.extend(
+            f"[INFO] warmup: {line}" for line in warmup_result.lines
+        )
+        if not warmup_result.ok:
+            result.ok = False
+            result.lines.insert(0, "[FAIL] warmup request did not complete")
+            return result
+
+    for repetition in range(1, repetitions + 1):
+        measured = run_cycle(cycle_index, f"Measurement {repetition}/{repetitions}")
+        cycle_index += 1
+        measured_results.append(measured)
+        result.lines.extend(
+            f"[INFO] measurement {repetition}: {line}"
+            for line in measured.lines
+        )
+        if not measured.ok:
+            result.ok = False
+            result.lines.insert(
+                0,
+                f"[FAIL] measurement {repetition} did not complete",
+            )
+            return result
+
+    summaries = [
+        measured.details.get("token_rate_summary", {})
+        for measured in measured_results
+    ]
+    median_summary = {
+        key: _median_rate(summaries, key)
+        for key in (
+            "prompt_tokens_per_second",
+            "generation_tokens_per_second",
+            "aggregate_tokens_per_second",
+            "wall_seconds",
+        )
+    }
+    samples = [
+        {
+            "repetition": index,
+            **summary,
+        }
+        for index, summary in enumerate(summaries, start=1)
+    ]
+    first_parameters = measured_results[0].details.get("parameters", {})
+    if not isinstance(first_parameters, dict):
+        first_parameters = {}
+    result.details = {
+        "warmup": bool(warmup),
+        "repetitions": repetitions,
+        "parameters": first_parameters,
+        "median": median_summary,
+        "samples": samples,
+    }
+    result.lines.append(
+        "[PASS] median prompt "
+        f"{_rate_text(median_summary['prompt_tokens_per_second'])}, "
+        "generation "
+        f"{_rate_text(median_summary['generation_tokens_per_second'])}, "
+        "wall-throughput "
+        f"{_rate_text(median_summary['aggregate_tokens_per_second'])}"
+    )
+
+    metrics_db = str(config.get("metrics_db", ""))
+    if metrics_db:
+        series_id = uuid4().hex
+        series_details = {
+            "series_id": series_id,
+            "warmup": bool(warmup),
+            "repetitions": repetitions,
+            "median": median_summary,
+            "samples": samples,
+        }
+        try:
+            store = TokenRateStore(metrics_db)
+            for repetition, measured in enumerate(measured_results, start=1):
+                raw_metrics = measured.details.get("token_metrics", [])
+                metrics: list[TokenMetric] = []
+                for raw_metric in raw_metrics:
+                    if not isinstance(raw_metric, dict):
+                        continue
+                    metrics.append(TokenMetric(**raw_metric))
+                if not metrics:
+                    continue
+                details = dict(measured.details)
+                details["series"] = {
+                    **series_details,
+                    "repetition": repetition,
+                }
+                parameters = measured.details.get("parameters", {})
+                summary = measured.details.get("token_rate_summary", {})
+                store.record_run(
+                    metrics,
+                    test_name=measured.name,
+                    context_tokens=int(parameters.get("context_tokens", 0)),
+                    parallel_slots=int(parameters.get("parallel_slots", 0)),
+                    wall_seconds=float(summary.get("wall_seconds", 0)),
+                    success=measured.ok,
+                    details=details,
+                )
+            _info(result, f"token-rate metrics persisted to {metrics_db}")
+        except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            _warn(result, f"could not persist token-rate metrics: {exc}")
+    else:
         _warn(result, "token-rate metrics are not persisted; metrics_db is not configured")
     return result
 
@@ -874,6 +1145,11 @@ def _parser() -> argparse.ArgumentParser:
     capacity.add_argument("--input-tokens", type=int)
     capacity.add_argument("--output-tokens", type=int)
     capacity.add_argument("--parallel", type=int)
+    capacity.add_argument("--repetitions", type=int)
+    warmup = capacity.add_mutually_exclusive_group()
+    warmup.add_argument("--warmup", dest="warmup", action="store_true")
+    warmup.add_argument("--no-warmup", dest="warmup", action="store_false")
+    capacity.set_defaults(warmup=None)
     capacity.add_argument(
         "--metrics-db",
         dest="capacity_metrics_db",
@@ -893,12 +1169,22 @@ def main() -> int:
     elif args.command == "runtime":
         result = runtime_health_test(config)
     elif args.command == "capacity":
-        result = capacity_test(
+        result = capacity_test_series(
             config,
             context_tokens=args.context_tokens,
             input_tokens=args.input_tokens,
             output_tokens=args.output_tokens,
             parallel=args.parallel,
+            warmup=(
+                bool(args.warmup)
+                if args.warmup is not None
+                else bool(config.get("capacity_test_warmup", True))
+            ),
+            repetitions=(
+                args.repetitions
+                if args.repetitions is not None
+                else int(config.get("capacity_test_repetitions", 3))
+            ),
         )
     elif args.command == "usb4":
         result = usb4_test(config)

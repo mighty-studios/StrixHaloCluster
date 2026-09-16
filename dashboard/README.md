@@ -30,9 +30,16 @@ The installer reads `/etc/qwen3d8/cluster.env` and
 
 - `qwen3d8-node-agent.service` on both nodes
 - `qwen3d8-dashboard.service` on the controller
+- `qwen3d8-server-restart.service` on the controller
 
 Rerunning the installer copies the current dashboard files and restarts its
 managed services, so it is also the supported way to deploy dashboard updates.
+
+The controller dashboard includes a **Restart Qwen server** button. It starts a
+dedicated root-owned systemd helper through a polkit rule restricted to the
+dashboard service account; it cannot directly control arbitrary services.
+Restarting interrupts active inference requests, and the dashboard remains
+degraded until the model finishes loading.
 
 The worker agent listens only on the private cluster address. The dashboard
 defaults to port `7860`; the agent defaults to port `8765`. UFW rules are
@@ -43,16 +50,20 @@ The capacity-test defaults are configurable at install time:
 ```bash
 sudo bash dashboard/setup-dashboard.sh \
   --role server \
-  --test-output 2048 \
+  --test-input 65536 \
+  --test-output 8192 \
+  --test-parallel 1 \
+  --test-repetitions 3 \
   --test-safety-margin 96
 ```
 
-The dashboard installer does not accept context or parallel-capacity
-parameters. It reads `CONTEXT_PER_SLOT` and `PARALLEL_SLOTS` from
-`/etc/qwen3d8/cluster.env`, which is written by `setup-qwen3d8.sh`. Those
-installed values are used for configuration checks and as the default capacity
-test target. The dashboard UI and CLI can still request a smaller one-off test,
-but a stale dashboard JSON value cannot override the installed Qwen capacity.
+The dashboard installer accepts a smaller timing-test workload independently
+from the installed Qwen capacity. The default is 65,536 prompt input tokens,
+8,192 output tokens, one parallel slot, one warmup request, and three measured
+repetitions. The generated context budget includes the output token count and
+the safety margin. It also reads `CONTEXT_PER_SLOT` and `PARALLEL_SLOTS` from
+`/etc/qwen3d8/cluster.env`, which is written by `setup-qwen3d8.sh`; those
+installed values remain the source of truth for configuration checks.
 For Q4, `--context 512` configures a 512 Ki per-slot context with 2x YaRN
 scaling from the model's native 256 Ki window.
 
@@ -79,16 +90,27 @@ python3 dashboard/cluster_tests.py --config /etc/qwen3d8/dashboard.json all
 ```
 
 The capacity test sends the configured number of concurrent synthetic requests
-to `llama-server`. By default, each request uses the installed per-slot context
-minus the configured output budget and safety margin. For a 256 Ki slot, this
-is a 260,000-token prompt plus 2,048 generated tokens. Override it for a
-smaller one-off CLI run:
+to `llama-server`. The prompt input and output token counts are separate
+settings. Override them for a one-off CLI run:
 
 ```bash
 python3 dashboard/cluster_tests.py \
   --config /etc/qwen3d8/dashboard.json \
-  capacity --context-tokens 131072 --output-tokens 1024 --parallel 3
+  capacity --input-tokens 65536 --output-tokens 8192 --parallel 1 \
+  --repetitions 3
 ```
+
+The dashboard's **Capacity Test** section provides one configurable timing
+action. It can run an optional warmup followed by repeated measured requests
+and reports the median prompt, generation, and wall-clock rates. Set measured
+repetitions to `1` to disable aggregation, or use `--no-warmup` for a cold
+measurement. The action asks for confirmation because it interrupts normal
+inference and sends synthetic requests. The dashboard shows the parameters
+and median from the latest recorded series below the aggregate results.
+The capacity-test timeout is derived automatically from the requested token
+workload and parallel-slot count, with extra headroom for long-context tests.
+An optional `capacity_timeout` value in the dashboard JSON can override that
+calculation, but normal installations do not need one.
 
 Each completed capacity request records prompt tokens/s, generation tokens/s,
 wall-clock throughput, token counts, context size, and concurrency in the

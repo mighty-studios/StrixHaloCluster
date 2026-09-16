@@ -5,12 +5,24 @@ from __future__ import annotations
 
 import argparse
 from html import escape
+import json
 import sqlite3
+import subprocess
 import threading
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+FULL_CAPACITY_CONFIRMATION = (
+    "This timing test sends synthetic requests and may interrupt production "
+    "workloads. Warmup requests are excluded from the median. Continue?"
+)
+SERVER_RESTART_UNIT = "qwen3d8-server-restart.service"
+SERVER_RESTART_CONFIRMATION = (
+    "Restart the controller Qwen server? Active inference requests will be "
+    "interrupted, and model loading may take several minutes."
+)
 
 try:
     from .cluster_monitor import (
@@ -24,6 +36,7 @@ try:
     from .cluster_tests import (
         TestResult,
         capacity_test,
+        capacity_test_series,
         configuration_test,
         full_test,
         runtime_health_test,
@@ -41,6 +54,7 @@ except ImportError:
     from cluster_tests import (
         TestResult,
         capacity_test,
+        capacity_test_series,
         configuration_test,
         full_test,
         runtime_health_test,
@@ -92,6 +106,18 @@ def _rate_text(value: Any) -> str:
     if not isinstance(value, (int, float)):
         return "n/a"
     return f"{value:,.1f} tok/s"
+
+
+def _token_count_text(value: Any) -> str:
+    if isinstance(value, int):
+        return f"{value:,}"
+    return "n/a" if value is None else str(value)
+
+
+def _duration_text(value: Any) -> str:
+    if isinstance(value, (int, float)) and value >= 0:
+        return f"{value / 60:,.0f} min"
+    return "n/a"
 
 
 def _configuration_value(value: Any) -> str:
@@ -177,18 +203,20 @@ def render_installed_configuration(config: dict[str, Any]) -> str:
 
 def render_token_history(summary: dict[str, Any]) -> str:
     if summary.get("error"):
-        return f"## Token-rate statistics\n\n**Unavailable:** {summary['error']}"
+        return f"## Capacity test results\n\n**Unavailable:** {summary['error']}"
 
     lines = [
-        "## Token-rate statistics",
+        "## Capacity test results",
         "Rates are recorded from triggered capacity tests and retained in SQLite.",
+        "The table aggregates recorded runs; parameters below describe "
+        "the latest run.",
         "",
         "| Window | Test runs | Requests | Prompt rate | Generation rate | Aggregate wall throughput |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     windows = summary.get("windows", [])
     if not isinstance(windows, list):
-        return "## Token-rate statistics\n\n**Unavailable:** invalid history payload"
+        return "## Capacity test results\n\n**Unavailable:** invalid history payload"
     for window in windows:
         if not isinstance(window, dict):
             continue
@@ -205,23 +233,66 @@ def render_token_history(summary: dict[str, Any]) -> str:
 
     latest = summary.get("latest")
     if isinstance(latest, dict):
-        latest_context = latest.get("context_tokens")
-        context_text = (
-            f"{latest_context:,}"
-            if isinstance(latest_context, int)
-            else str(latest_context or "n/a")
+        latest_details = latest.get("details")
+        if not isinstance(latest_details, dict):
+            latest_details = {}
+        latest_parameters = latest_details.get("parameters")
+        if not isinstance(latest_parameters, dict):
+            latest_parameters = latest_details
+        context_text = _token_count_text(
+            latest_parameters.get("context_tokens", latest.get("context_tokens"))
         )
+        input_text = _token_count_text(latest_parameters.get("input_tokens"))
+        output_text = _token_count_text(latest_parameters.get("output_tokens"))
+        parallel_text = _token_count_text(
+            latest_parameters.get("parallel_slots", latest.get("parallel_slots"))
+        )
+        safety_margin_text = _token_count_text(
+            latest_parameters.get("safety_margin_tokens")
+        )
+        timeout_text = _duration_text(
+            latest_parameters.get("timeout_seconds")
+        )
+        series = latest_details.get("series")
         lines.extend(
             [
                 "",
                 (
                     f"**Latest:** {latest.get('test_name', 'capacity test')} at "
-                    f"{latest.get('recorded_at_iso', 'unknown')}  |  "
-                    f"context {context_text} tokens/slot  |  "
-                    f"parallel {latest.get('parallel_slots', 'n/a')}"
+                    f"{latest.get('recorded_at_iso', 'unknown')}"
+                ),
+                (
+                    f"**Parameters:** context {context_text} tokens/slot  |  "
+                    f"input {input_text} tokens  |  "
+                    f"output {output_text} tokens  |  "
+                    f"parallel {parallel_text} slots  |  "
+                    f"safety margin {safety_margin_text} tokens  |  "
+                    f"timeout {timeout_text}"
                 ),
             ]
         )
+        if isinstance(series, dict):
+            median_rates = series.get("median")
+            if not isinstance(median_rates, dict):
+                median_rates = {}
+            lines.extend(
+                [
+                    (
+                        f"**Measurements:** "
+                        f"{'1 warmup + ' if series.get('warmup') else ''}"
+                        f"{series.get('repetitions', 'n/a')} measured; "
+                        "median reported"
+                    ),
+                    (
+                        f"**Median:** prompt "
+                        f"{_rate_text(median_rates.get('prompt_tokens_per_second'))}  |  "
+                        f"generation "
+                        f"{_rate_text(median_rates.get('generation_tokens_per_second'))}  |  "
+                        f"wall-throughput "
+                        f"{_rate_text(median_rates.get('aggregate_tokens_per_second'))}"
+                    ),
+                ]
+            )
     return "\n".join(lines)
 
 
@@ -519,6 +590,61 @@ class DashboardApp:
             self._last_error = ""
         return ""
 
+    def _action_response(
+        self, output: str
+    ) -> tuple[str, str, str, str, str]:
+        summary, token_history, error_log, details = self.refresh()
+        return output, summary, token_history, error_log, details
+
+    def restart_server(self) -> tuple[str, str, str, str, str]:
+        """Request a controlled restart of the controller Qwen service."""
+
+        if str(self.config.get("role", "")).lower() != "server":
+            message = (
+                "[FAIL] Qwen server restart is available only on the controller."
+            )
+            self._log_error(message)
+            return self._action_response(message)
+
+        with self._test_lock:
+            if self._active_test:
+                message = (
+                    f"[FAIL] Cannot restart the Qwen server while "
+                    f"{self._active_test} is running. Cancel it first."
+                )
+                self._log_error(message)
+                return self._action_response(message)
+            self._active_test = "Qwen server restart"
+            try:
+                completed = subprocess.run(
+                    ["systemctl", "start", SERVER_RESTART_UNIT],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                message = f"[FAIL] Could not request Qwen server restart: {exc}"
+                self._log_error(message)
+                return self._action_response(message)
+            finally:
+                self._active_test = ""
+
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            fallback = f"systemctl exited {completed.returncode}"
+            message = (
+                "[FAIL] Qwen server restart request failed: "
+                f"{detail[:500] or fallback}"
+            )
+            self._log_error(message)
+            return self._action_response(message)
+
+        return self._action_response(
+            "[PASS] Qwen server restart requested. "
+            "The dashboard will report readiness after model loading completes."
+        )
+
     def request_cancel(self) -> str:
         with self._test_lock:
             active_test = self._active_test
@@ -623,6 +749,9 @@ class DashboardApp:
         output_tokens: float | None = None,
         parallel: float | None = None,
         progress: Callable[..., Any] | None = None,
+        input_tokens: float | None = None,
+        warmup: bool = True,
+        repetitions: float | None = 3,
     ) -> tuple[str, str, str, str, str]:
         def integer_or_none(value: float | None) -> int | None:
             return int(value) if value is not None else None
@@ -632,11 +761,19 @@ class DashboardApp:
             cancel_event: threading.Event | None = None,
             progress: Callable[..., Any] | None = None,
         ) -> TestResult:
-            return capacity_test(
+            measured_repetitions = (
+                int(repetitions)
+                if repetitions is not None
+                else int(config.get("capacity_test_repetitions", 3))
+            )
+            return capacity_test_series(
                 config,
                 context_tokens=integer_or_none(context_tokens),
+                input_tokens=integer_or_none(input_tokens),
                 output_tokens=integer_or_none(output_tokens),
                 parallel=integer_or_none(parallel),
+                warmup=bool(warmup),
+                repetitions=measured_repetitions,
                 cancel_event=cancel_event,
                 progress=progress,
             )
@@ -685,15 +822,19 @@ def build_demo(app: DashboardApp) -> Any:
         return app.run_runtime(progress=progress)
 
     def run_capacity_with_progress(
-        context_tokens,
+        input_tokens,
         output_tokens,
         parallel,
+        warmup,
+        repetitions,
         progress=gr.Progress(),
     ):
         return app.run_capacity(
-            context_tokens,
-            output_tokens,
-            parallel,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            parallel=parallel,
+            warmup=warmup,
+            repetitions=repetitions,
             progress=progress,
         )
 
@@ -703,11 +844,13 @@ def build_demo(app: DashboardApp) -> Any:
     def run_all_with_progress(progress=gr.Progress()):
         return app.run_all(progress=progress)
 
+    def restart_server():
+        return app.restart_server()
+
     with gr.Blocks(title="Strix Halo Cluster Dashboard") as demo:
         gr.Markdown("# Strix Halo Cluster Dashboard")
         gr.Markdown(render_installed_configuration(app.config))
         status = gr.Markdown("Loading cluster status...")
-        token_history = gr.Markdown("Loading token-rate statistics...")
         error_log = gr.Textbox(
             label="Error log",
             lines=8,
@@ -718,41 +861,76 @@ def build_demo(app: DashboardApp) -> Any:
 
         gr.Markdown("## On-demand verification")
         gr.Markdown(
-            "Capacity testing sends synthetic requests to the controller. "
-            "Run it when no production workload is active."
+            "Run diagnostics when no production workload is active."
         )
-        with gr.Row():
-            context_input = gr.Number(
-                label="Test context per slot (tokens)",
-                value=app.config.get("capacity_test_context_tokens", 262144),
-                precision=0,
-            )
-            output_input = gr.Number(
-                label="Test output tokens",
-                value=app.config.get("capacity_test_output_tokens", 2048),
-                precision=0,
-            )
-            parallel_input = gr.Number(
-                label="Test parallel slots",
-                value=app.config.get("capacity_test_parallel_slots", 3),
-                precision=0,
-            )
+
         with gr.Row():
             refresh_button = gr.Button("Refresh status")
+            restart_button = None
+            if str(app.config.get("role", "")).lower() == "server":
+                restart_button = gr.Button(
+                    "Restart Qwen server", variant="stop"
+                )
             configuration_button = gr.Button("Verify configuration")
             runtime_button = gr.Button("Runtime health and slots")
-        with gr.Row():
-            capacity_button = gr.Button("Run configured capacity test")
             usb4_button = gr.Button("Test USB4 throughput")
             all_button = gr.Button("Run full diagnostic")
             cancel_button = gr.Button("Cancel running test", variant="stop")
             clear_log_button = gr.Button("Clear error log")
         output = gr.Textbox(
-            label="Test output",
+            label="Diagnostic output",
             lines=24,
             max_lines=40,
             interactive=False,
         )
+
+        with gr.Group():
+            gr.Markdown("## Capacity Test")
+            gr.Markdown(
+                "Capacity testing sends synthetic requests to the controller. "
+                "The prompt input and response sizes below define a repeatable "
+                "timing test. Run it when no production workload is active."
+            )
+            with gr.Row():
+                input_input = gr.Number(
+                    label="Prompt input tokens",
+                    value=app.config.get(
+                        "capacity_test_input_tokens", 65536
+                    ),
+                    precision=0,
+                )
+                output_input = gr.Number(
+                    label="Test output tokens",
+                    value=app.config.get("capacity_test_output_tokens", 8192),
+                    precision=0,
+                )
+                parallel_input = gr.Number(
+                    label="Parallel slots",
+                    value=app.config.get(
+                        "capacity_test_parallel_slots", 1
+                    ),
+                    precision=0,
+                )
+            with gr.Row():
+                warmup_input = gr.Checkbox(
+                    label="Warmup before measuring",
+                    value=app.config.get("capacity_test_warmup", True),
+                )
+                repetitions_input = gr.Number(
+                    label="Measured repetitions",
+                    value=app.config.get("capacity_test_repetitions", 3),
+                    precision=0,
+                    minimum=1,
+                    maximum=10,
+                )
+            capacity_button = gr.Button("Run capacity timing test")
+            capacity_output = gr.Textbox(
+                label="Capacity test output",
+                lines=24,
+                max_lines=40,
+                interactive=False,
+            )
+            token_history = gr.Markdown("Loading Capacity test results...")
 
         refresh_button.click(
             app.refresh, outputs=[status, token_history, error_log, details]
@@ -765,10 +943,35 @@ def build_demo(app: DashboardApp) -> Any:
             run_runtime_with_progress,
             outputs=[output, status, token_history, error_log, details],
         )
+        if restart_button is not None:
+            restart_button.click(
+                restart_server,
+                outputs=[output, status, token_history, error_log, details],
+                js=f"() => window.confirm({json.dumps(SERVER_RESTART_CONFIRMATION)})",
+            )
         capacity_event = capacity_button.click(
             run_capacity_with_progress,
-            inputs=[context_input, output_input, parallel_input],
-            outputs=[output, status, token_history, error_log, details],
+            inputs=[
+                input_input,
+                output_input,
+                parallel_input,
+                warmup_input,
+                repetitions_input,
+            ],
+            outputs=[
+                capacity_output,
+                status,
+                token_history,
+                error_log,
+                details,
+            ],
+            js=(
+                "(input_tokens, output_tokens, parallel, warmup, repetitions) => {"
+                f"if (!window.confirm({json.dumps(FULL_CAPACITY_CONFIRMATION)})) "
+                "return false;"
+                "return [input_tokens, output_tokens, parallel, warmup, repetitions];"
+                "}"
+            ),
         )
         usb4_event = usb4_button.click(
             run_usb4_with_progress,

@@ -37,10 +37,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "yarn_rope_scale": 0.0,
     "expected_parallel_slots": 0,
     "expected_context_per_slot": 0,
-    "capacity_test_context_tokens": 262144,
-    "capacity_test_output_tokens": 2048,
-    "capacity_test_parallel_slots": 3,
+    "capacity_test_input_tokens": 65536,
+    "capacity_test_context_tokens": 73824,
+    "capacity_test_output_tokens": 8192,
+    "capacity_test_parallel_slots": 1,
     "capacity_test_safety_margin_tokens": 96,
+    "capacity_test_warmup": True,
+    "capacity_test_repetitions": 3,
     "metrics_db": "/var/lib/qwen-dashboard/token-rates.sqlite3",
     "iperf_duration": 10,
     "iperf_parallel": 4,
@@ -99,6 +102,18 @@ def _as_float(value: Any, default: float) -> float:
         return default
 
 
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
 def _mapping(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -153,6 +168,7 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
             usb4_env.get("IPERF_PORT"), config["iperf_port"]
         )
 
+    file_config: dict[str, Any] = {}
     if path:
         try:
             file_config = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -189,28 +205,42 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     config["expected_context_per_slot"] = (
         expected_context if expected_context > 0 else config["context_per_slot"]
     )
+    config["capacity_test_input_tokens"] = _as_int(
+        config.get("capacity_test_input_tokens"), 65536
+    )
     config["capacity_test_context_tokens"] = _as_int(
-        config.get("capacity_test_context_tokens"), 262144
+        config.get("capacity_test_context_tokens"), 73824
     )
     config["capacity_test_output_tokens"] = _as_int(
-        config.get("capacity_test_output_tokens"), 2048
+        config.get("capacity_test_output_tokens"), 8192
     )
     config["capacity_test_parallel_slots"] = _as_int(
-        config.get("capacity_test_parallel_slots"), 3
+        config.get("capacity_test_parallel_slots"), 1
     )
     config["capacity_test_safety_margin_tokens"] = _as_int(
         config.get("capacity_test_safety_margin_tokens"), 96
+    )
+    config["capacity_test_warmup"] = _as_bool(
+        config.get("capacity_test_warmup"), True
+    )
+    config["capacity_test_repetitions"] = max(
+        1, min(_as_int(config.get("capacity_test_repetitions"), 3), 10)
     )
     installed_parallel = _as_int(cluster_env.get("PARALLEL_SLOTS"), 0)
     installed_context = _as_int(cluster_env.get("CONTEXT_PER_SLOT"), 0)
     if installed_parallel > 0:
         config["installed_parallel_slots"] = installed_parallel
         config["expected_parallel_slots"] = installed_parallel
-        config["capacity_test_parallel_slots"] = installed_parallel
+        if "capacity_test_parallel_slots" not in file_config:
+            config["capacity_test_parallel_slots"] = installed_parallel
     if installed_context > 0:
         config["installed_context_per_slot"] = installed_context
         config["expected_context_per_slot"] = installed_context
-        config["capacity_test_context_tokens"] = installed_context
+        if (
+            "capacity_test_context_tokens" not in file_config
+            and "capacity_test_input_tokens" not in file_config
+        ):
+            config["capacity_test_context_tokens"] = installed_context
     installed_native_context = _as_int(
         cluster_env.get("NATIVE_CONTEXT_PER_SLOT"), 0
     )
