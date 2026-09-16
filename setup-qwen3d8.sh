@@ -52,6 +52,7 @@ MODEL_SIZE_SOURCE="${MODEL_SIZE_SOURCE:-https://huggingface.co/unsloth/Qwen3.8-F
 CONFIG_ROOT="/etc/qwen3d8"
 
 RPC_CACHE="${RPC_CACHE:-/srv/llama-rpc-cache}"
+RPC_CACHE_ENABLED="${RPC_CACHE_ENABLED:-0}"
 RPC_CACHE_MIN_GIB="${RPC_CACHE_MIN_GIB:-}"
 RPC_PORT="${RPC_PORT:-50053}"
 LLAMA_PORT="${LLAMA_PORT:-8081}"
@@ -147,7 +148,8 @@ Options:
   --user <name>              Desktop account passed to setup-environment.sh
   --password-file <path>     Password file passed to setup-environment.sh
   --model-root <path>        Controller model root (default: $MODEL_ROOT)
-  --rpc-cache <path>         Peer RPC tensor cache (default: $RPC_CACHE)
+  --rpc-cache <path>         Optional peer RPC cache path (default: $RPC_CACHE)
+  --enable-rpc-cache         Enable the optional peer RPC disk cache
   --gtt-gib <gib>            TTM/GTT mapping limit (default: $GTT_GIB)
   --kv-cache <type>          llama.cpp K/V cache type (default: $KV_CACHE_TYPE)
   --tensor-split <a,b>       Alias for --balance
@@ -218,6 +220,9 @@ while [ "$#" -gt 0 ]; do
       need_arg "$1" "${2:-}"
       RPC_CACHE="$2"
       shift
+      ;;
+    --enable-rpc-cache)
+      RPC_CACHE_ENABLED=1
       ;;
     --gtt-gib)
       need_arg "$1" "${2:-}"
@@ -397,7 +402,7 @@ compute_memory_plan() {
     die "balance $TENSOR_SPLIT estimates peer use at ${PEER_ESTIMATE_GIB} GiB, above the ${GTT_GIB} GiB limit"
   fi
 
-  if [ -z "$RPC_CACHE_MIN_GIB" ]; then
+  if [ "$RPC_CACHE_ENABLED" = "1" ] && [ -z "$RPC_CACHE_MIN_GIB" ]; then
     RPC_CACHE_MIN_GIB="$(
       awk \
         -v model="$MODEL_MEMORY_ESTIMATE_GIB" \
@@ -414,6 +419,10 @@ compute_memory_plan() {
 resolve_quant
 
 [ -n "$TARGET_USER" ] || die "could not determine the desktop account; pass --user"
+case "$RPC_CACHE_ENABLED" in
+  0|1) ;;
+  *) die "RPC_CACHE_ENABLED must be 0 or 1" ;;
+esac
 [[ "$GTT_GIB" =~ ^[0-9]+$ ]] || die "--gtt-gib must be a whole number"
 [[ "$HOST_BUFFER_ESTIMATE_GIB" =~ ^[0-9]+$ ]] \
   || die "HOST_BUFFER_ESTIMATE_GIB must be a whole number"
@@ -525,7 +534,11 @@ echo "  balance:                  $TENSOR_SPLIT (controller,peer)"
 echo "  estimated controller use: $CONTROLLER_ESTIMATE_GIB GiB"
 echo "  estimated peer use:       $PEER_ESTIMATE_GIB GiB"
 echo "  estimated headroom:       controller $CONTROLLER_HEADROOM_GIB GiB, peer $PEER_HEADROOM_GIB GiB"
-echo "  peer RPC disk cache:       at least $RPC_CACHE_MIN_GIB GiB"
+if [ "$RPC_CACHE_ENABLED" = "1" ]; then
+  echo "  peer RPC disk cache:       enabled; at least $RPC_CACHE_MIN_GIB GiB"
+else
+  echo "  peer RPC disk cache:       disabled"
+fi
 echo "  artifact source:           $MODEL_SIZE_SOURCE"
 echo "  host-buffer source:        $LARGE_QUANT_BLOCKER_SOURCE"
 
@@ -898,8 +911,10 @@ download_model() {
 prepare_peer_cache() {
   [ "$NODE_ROLE" = "peer" ] || return 0
 
-  local required_bytes=$((RPC_CACHE_MIN_GIB * 1024 * 1024 * 1024))
-  check_free_space "$RPC_CACHE" "$required_bytes" "RPC tensor cache"
+  if [ "$RPC_CACHE_ENABLED" = "1" ]; then
+    local required_bytes=$((RPC_CACHE_MIN_GIB * 1024 * 1024 * 1024))
+    check_free_space "$RPC_CACHE" "$required_bytes" "RPC tensor cache"
+  fi
   install -d -m 2775 -o "$LLAMA_USER" -g "$LLAMA_USER" "$RPC_CACHE"
 }
 
@@ -918,6 +933,8 @@ CLUSTER_LOCAL_IP=$CLUSTER_LOCAL_IP
 CLUSTER_PEER_IP=$CLUSTER_PEER_IP
 RPC_PORT=$RPC_PORT
 LLAMA_PORT=$LLAMA_PORT
+RPC_CACHE=$RPC_CACHE
+RPC_CACHE_ENABLED=$RPC_CACHE_ENABLED
 MODEL_FILE=$MODEL_FILE
 MODEL_EXPECTED_BYTES=$MODEL_EXPECTED_BYTES
 MODEL_ARTIFACT_GIB=$MODEL_ARTIFACT_GIB
@@ -996,6 +1013,13 @@ install_peer_service() {
 
   log "Installing the Qwen3.8 RPC worker service"
 
+  local rpc_cache_environment=""
+  local rpc_cache_argument=""
+  if [ "$RPC_CACHE_ENABLED" = "1" ]; then
+    rpc_cache_environment="Environment=LLAMA_CACHE=$RPC_CACHE"
+    rpc_cache_argument="-c"
+  fi
+
   cat > /etc/systemd/system/qwen3d8-rpc.service <<UNIT
 [Unit]
 Description=Qwen3.8 llama.cpp RPC worker
@@ -1008,15 +1032,14 @@ User=$LLAMA_USER
 Group=$LLAMA_USER
 SupplementaryGroups=render video
 Environment=HOME=$LLAMA_HOME
-Environment=LLAMA_CACHE=$RPC_CACHE
+$rpc_cache_environment
 Environment=GGML_RPC_NO_RDMA=1
 UnsetEnvironment=GGML_CUDA_ENABLE_UNIFIED_MEMORY
 ExecStart=/usr/bin/env -u GGML_CUDA_ENABLE_UNIFIED_MEMORY \
   /usr/local/bin/ggml-rpc-server \
   --host $CLUSTER_LOCAL_IP \
   --port $RPC_PORT \
-  --device ROCm0 \
-  -c
+  --device ROCm0 $rpc_cache_argument
 Restart=always
 RestartSec=10
 LimitMEMLOCK=infinity
@@ -1291,7 +1314,11 @@ if [ "$NODE_ROLE" = "server" ]; then
   echo "  status:        sudo qwen3d8-status"
 else
   echo "  RPC worker:    $CLUSTER_LOCAL_IP:$RPC_PORT"
-  echo "  RPC cache:     $RPC_CACHE"
+  if [ "$RPC_CACHE_ENABLED" = "1" ]; then
+    echo "  RPC cache:     $RPC_CACHE (enabled)"
+  else
+    echo "  RPC cache:     disabled"
+  fi
   echo "  status:        sudo qwen3d8-status"
 fi
 
