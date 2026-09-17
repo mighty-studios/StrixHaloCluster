@@ -29,3 +29,17 @@ for both the dashboard capacity test and normal production traffic.
 If `LLAMA_CPP_COMMIT` is ever updated to a newer commit, re-check that this
 patch still applies (`git apply --check`) and refresh the context lines if
 upstream has changed the surrounding code.
+
+## `llama-cpp-427291b-rpc-cache-weights-only.patch`
+
+Targets commit `427291b5b34cd914a31b3fd3b61a68f6184f4b9f` (the commit pinned
+by `LLAMA_CPP_COMMIT` in `setup-qwen3d8.sh`).
+
+The pinned RPC backend's local cache path caches every RPC tensor transfer
+larger than 10 MiB. During long capacity tests that includes compute-buffer
+activation transfers, so enabling `ggml-rpc-server -c` can continuously write
+new cache entries until the peer disk fills.
+
+The patch ports the upstream behavior that uses the hash cache only for weight
+buffers. That preserves the intended model-reload optimization while preventing
+capacity-test activation traffic from flooding the RPC cache directory.

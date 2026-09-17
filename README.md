@@ -56,7 +56,7 @@ Both nodes run ComfyUI. The controller owns the shared store and exports it to t
 - Sufficient local storage for the selected model and, if enabled, the optional peer RPC cache
 - A trusted LAN: the default Samba share is anonymous and read/write
 
-The installer planning estimates are 110 GiB for Q4, 150 GiB for Q5, and 160 GiB for Q6. For a fresh download, allow roughly 129 GiB, 173 GiB, and 183 GiB of free space respectively because the installer reserves 25 GiB during download. The peer RPC disk cache is disabled by default because its upstream implementation has no size limit; enable it only when the cache is on storage with an explicit retention or quota policy. Q5 and Q6 are experimental on this two-node topology. If Hugging Face authentication is required, set `HF_TOKEN` and preserve it through `sudo`, for example: `sudo --preserve-env=HF_TOKEN bash setup-qwen3d8.sh ...`.
+The installer planning estimates are 110 GiB for Q4, 150 GiB for Q5, and 160 GiB for Q6. For a fresh download, allow roughly 129 GiB, 173 GiB, and 183 GiB of free space respectively because the installer reserves 25 GiB during download. The optional peer RPC disk cache is disabled by default. Q5 and Q6 are experimental on this two-node topology. If Hugging Face authentication is required, set `HF_TOKEN` and preserve it through `sudo`, for example: `sudo --preserve-env=HF_TOKEN bash setup-qwen3d8.sh ...`.
 
 ## Quick start
 
