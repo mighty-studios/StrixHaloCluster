@@ -101,7 +101,7 @@ before using the extended window in production.
 
 | Script | Purpose |
 | --- | --- |
-| `setup-environment.sh` | Base node setup: USB4, Samba file drop, XRDP, and UFW |
+| `setup-environment.sh` | Base node setup: USB4, Samba file drop, XRDP, SSH, and UFW |
 | `setup-comfyui.sh` | ComfyUI on each node with an NFS-shared model/data store |
 | `setup-qwen3d8.sh` | ROCm, `llama.cpp`, Qwen3.8 model, RPC services, and controller web UI |
 | `verify-environment.sh` | Checks services, networking, firewall rules, and USB4 throughput |
@@ -117,6 +117,7 @@ before using the extended window in production.
 - ComfyUI: `http://<node>:8188`
 - Windows file drop: `\\<node>\xfer`; XRDP: `<node>:3389`
 - XRDP redirected Windows drives: `~/thinclient_drives` inside the remote session
+- SSH: `<node>:22` (OpenSSH server, installed and enabled by `setup-environment.sh`)
 
 All scripts are designed to be rerun safely. Use `--help` for the complete option list, review any `Action required` messages, and use `sudo qwen3d8-status` or `sudo usb4-cluster-status` for diagnostics.
 

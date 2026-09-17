@@ -10,6 +10,7 @@ TARGET_PASSWORD_FILE="${TARGET_PASSWORD_FILE:-}"
 
 INSTALL_SAMBA="${INSTALL_SAMBA:-1}"
 INSTALL_XRDP="${INSTALL_XRDP:-1}"
+INSTALL_SSH="${INSTALL_SSH:-1}"
 INSTALL_USB4="${INSTALL_USB4:-1}"
 CONFIGURE_FIREWALL="${CONFIGURE_FIREWALL:-1}"
 CONFIGURE_JOURNAL="${CONFIGURE_JOURNAL:-1}"
@@ -94,7 +95,8 @@ Installs only:
   - A private USB4 TCP/IP link between the two cluster nodes
   - A per-node Windows file drop at \\\\<host>\\$XFER_SHARE
   - XRDP remote desktop support
-  - Interface-scoped firewall rules for USB4, SMB, and RDP
+  - OpenSSH server for remote administration
+  - Interface-scoped firewall rules for USB4, SMB, RDP, and SSH
   - Journald caps, SMART monitoring, and periodic SSD TRIM
   - Software disablement of Wi-Fi and Bluetooth radios
 
@@ -126,7 +128,7 @@ Options:
   --keep-radios              Leave Wi-Fi and Bluetooth enabled
   --force-radio-disable      Disable Wi-Fi even if it carries the default route
   --skip <component>         Skip journal, diskhealth, radios, wifi, bluetooth,
-                             usb4, samba, xrdp, or firewall
+                             usb4, samba, xrdp, ssh, or firewall
   -h, --help                 Show this help
 
 Run the server role first. It starts a private iperf3 listener. When the peer
@@ -266,6 +268,7 @@ while [ "$#" -gt 0 ]; do
         usb4|cluster) INSTALL_USB4=0 ;;
         samba|smb|xfer) INSTALL_SAMBA=0 ;;
         xrdp|rdp|desktop) INSTALL_XRDP=0 ;;
+        ssh|sshd) INSTALL_SSH=0 ;;
         firewall|ufw) CONFIGURE_FIREWALL=0 ;;
         *) die "unknown component for --skip: $2" ;;
       esac
@@ -1838,13 +1841,33 @@ POLKIT
 }
 
 # =============================================================================
-# 6. FIREWALL
+# 6. SSH REMOTE ACCESS
+# =============================================================================
+configure_ssh() {
+  log "Installing OpenSSH server for remote administration"
+
+  apt-get install -y openssh-server >/dev/null 2>&1 || die "failed to install openssh-server"
+
+  ensure_boot_unit ssh.service
+  systemctl restart ssh.service
+
+  if systemctl is-active --quiet ssh.service; then
+    ok "SSH running on port 22"
+  else
+    die "SSH is not active; inspect systemctl status ssh"
+  fi
+}
+
+# =============================================================================
+# 7. FIREWALL
 # =============================================================================
 configure_firewall() {
   log "Configuring LAN and private USB4 UFW rules"
 
   apt-get install -y ufw >/dev/null 2>&1 || die "failed to install UFW"
-  ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1 || true
+  if [ "$INSTALL_SSH" = "1" ]; then
+    ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1 || true
+  fi
 
   local net
   for net in $LAN_NETS; do
@@ -1896,7 +1919,7 @@ configure_firewall() {
 }
 
 # =============================================================================
-# 7. APPLY SELECTED COMPONENTS AND REPORT
+# 8. APPLY SELECTED COMPONENTS AND REPORT
 # =============================================================================
 if [ "$INSTALL_USB4" = "1" ]; then
   configure_usb4
@@ -1910,6 +1933,11 @@ fi
 
 if [ "$INSTALL_XRDP" = "1" ]; then
   configure_xrdp
+  echo
+fi
+
+if [ "$INSTALL_SSH" = "1" ]; then
+  configure_ssh
   echo
 fi
 
@@ -1933,6 +1961,7 @@ fi
 [ "$INSTALL_XRDP" = "1" ] && echo "  Redirected drives:   ~/thinclient_drives"
 [ "$INSTALL_XRDP" = "1" ] && [ "$XRDP_CONCURRENT_LOCAL_ACTIVE" = "1" ] \
   && echo "  Concurrent local/RDP: XFCE uses a private D-Bus session"
+[ "$INSTALL_SSH" = "1" ] && echo "  SSH remote access:   $LAN_IP:22"
 [ "$CONFIGURE_JOURNAL" = "1" ] && echo "  Journal disk cap:    $JOURNAL_MAX_USE (keep free $JOURNAL_KEEP_FREE)"
 [ "$CONFIGURE_DISK_HEALTH" = "1" ] && echo "  Disk maintenance:    smartd monitoring + fstrim.timer"
 if [ "$DISABLE_WIFI" = "1" ] || [ "$DISABLE_BLUETOOTH" = "1" ]; then
