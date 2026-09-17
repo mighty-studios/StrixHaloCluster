@@ -107,10 +107,26 @@ repetitions to `1` to disable aggregation, or use `--no-warmup` for a cold
 measurement. The action asks for confirmation because it interrupts normal
 inference and sends synthetic requests. The dashboard shows the parameters
 and median from the latest recorded series below the aggregate results.
+The output-token setting is a maximum because the test honors the model's
+natural end-of-sequence token.
 The capacity-test timeout is derived automatically from the requested token
 workload and parallel-slot count, with extra headroom for long-context tests.
 An optional `capacity_timeout` value in the dashboard JSON can override that
 calculation, but normal installations do not need one.
+`llama-server` occasionally corrupts a single generation under sustained
+load and reports it as an HTTP 500 "does not match the expected ... format"
+error from its chat-message parser. This is an unresolved upstream
+generation bug reproduced across ROCm, CUDA, and Vulkan backends (see
+[ggml-org/llama.cpp#26381](https://github.com/ggml-org/llama.cpp/issues/26381)
+and [ggml-org/llama.cpp#20260](https://github.com/ggml-org/llama.cpp/issues/20260)),
+not a cluster misconfiguration. `setup-qwen3d8.sh` applies a small vendored
+patch (see [`patches/README.md`](../patches/README.md)) to the pinned
+llama.cpp build so a failed final parse salvages whatever content was
+recognized instead of throwing, which removes this error for any request
+where at least some output was parseable. The capacity test still retries an
+affected slot up to twice and notes the retry in its output, as a safety net
+for the rare case where nothing at all was parseable, and for deployments
+running an unpatched llama.cpp build.
 
 Each completed capacity request records prompt tokens/s, generation tokens/s,
 wall-clock throughput, token counts, context size, and concurrency in the

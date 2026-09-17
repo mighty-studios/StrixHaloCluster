@@ -69,6 +69,19 @@ DEFAULT_CAPACITY_PARALLEL_SLOTS = 1
 DEFAULT_CAPACITY_REPETITIONS = 3
 DEFAULT_CAPACITY_TIMEOUT_SECONDS = 3600.0
 CAPACITY_TIMEOUT_SAFETY_FACTOR = 2.0
+# llama-server occasionally corrupts a generation under sustained load and
+# reports it as a "does not match the expected ... format" HTTP 500 from its
+# chat-message parser. This is a known, unresolved upstream generation bug
+# (see ggml-org/llama.cpp#26381 and ggml-org/llama.cpp#20260) reproduced
+# across ROCm, CUDA, and Vulkan backends and is unrelated to the request
+# payload. setup-qwen3d8.sh applies a vendored patch (see
+# patches/README.md) so a failed final parse salvages whatever content was
+# recognized instead of throwing, which removes this error whenever at least
+# some output was parseable. The retry here remains a safety net for the
+# residual case where nothing at all was parseable, and for deployments
+# running an unpatched llama.cpp build.
+CAPACITY_GENERATION_ERROR_MARKER = "does not match the expected"
+CAPACITY_GENERATION_ERROR_RETRIES = 2
 
 
 @dataclass
@@ -179,6 +192,14 @@ def _matches_float(value: str | None, expected: float) -> bool:
         return abs(float(value or "") - expected) < 1e-6
     except (TypeError, ValueError):
         return False
+
+
+def _is_retryable_generation_error(status: int, body: Any) -> bool:
+    if status != 500 or not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    message = error.get("message") if isinstance(error, dict) else error
+    return isinstance(message, str) and CAPACITY_GENERATION_ERROR_MARKER in message
 
 
 def _post_json(
@@ -569,7 +590,7 @@ def capacity_test(
             "prompt": token_ids,
             "id_slot": slot,
             "n_predict": output_tokens,
-            "ignore_eos": True,
+            "ignore_eos": False,
             "cache_prompt": False,
             "stream": False,
             "temperature": 0,
@@ -578,18 +599,25 @@ def capacity_test(
         for slot in range(target_parallel)
     ]
     barrier = threading.Barrier(target_parallel + 1)
-    def submit(slot: int) -> tuple[int, int, Any, float]:
+    def submit(slot: int) -> tuple[int, int, Any, float, int]:
         barrier.wait()
         if cancel_event and cancel_event.is_set():
-            return slot, 499, {"error": "test cancelled"}, 0.0
+            return slot, 499, {"error": "test cancelled"}, 0.0, 0
         started = time.monotonic()
-        status, body = _post_json(
-            f"{base_url}/completion", payloads[slot], request_timeout
-        )
-        return slot, status, body, time.monotonic() - started
+        attempt = 0
+        while True:
+            status, body = _post_json(
+                f"{base_url}/completion", payloads[slot], request_timeout
+            )
+            if not _is_retryable_generation_error(status, body) or (
+                attempt >= CAPACITY_GENERATION_ERROR_RETRIES
+                or (cancel_event and cancel_event.is_set())
+            ):
+                return slot, status, body, time.monotonic() - started, attempt
+            attempt += 1
 
     executor = ThreadPoolExecutor(max_workers=target_parallel)
-    futures: list[Future[tuple[int, int, Any, float]]] = [
+    futures: list[Future[tuple[int, int, Any, float, int]]] = [
         executor.submit(submit, slot) for slot in range(target_parallel)
     ]
     test_started = time.monotonic()
@@ -599,7 +627,11 @@ def capacity_test(
     observed_contexts: list[int] = []
     timed_out = False
     cancelled = False
-    deadline = time.monotonic() + request_timeout + 10
+    deadline = (
+        time.monotonic()
+        + request_timeout * (CAPACITY_GENERATION_ERROR_RETRIES + 1)
+        + 10
+    )
     try:
         while not all(future.done() for future in futures):
             if cancel_event and cancel_event.is_set():
@@ -633,11 +665,11 @@ def capacity_test(
                 break
             time.sleep(0.25)
     finally:
-        results: list[tuple[int, int, Any, float]] = []
+        results: list[tuple[int, int, Any, float, int]] = []
         for future in futures:
             if not future.done():
                 future.cancel()
-                results.append((-1, 0, {"error": "request timed out"}, 0.0))
+                results.append((-1, 0, {"error": "request timed out"}, 0.0, 0))
                 continue
             try:
                 results.append(future.result(timeout=5))
@@ -648,7 +680,7 @@ def capacity_test(
                 ValueError,
                 threading.BrokenBarrierError,
             ) as exc:
-                results.append((-1, 0, {"error": str(exc)}, 0.0))
+                results.append((-1, 0, {"error": str(exc)}, 0.0, 0))
         executor.shutdown(
             wait=not (timed_out or cancelled), cancel_futures=True
         )
@@ -684,7 +716,16 @@ def capacity_test(
 
     run_id = uuid4().hex
     token_metrics = []
-    for slot, status, body, elapsed in sorted(results, key=lambda item: item[0]):
+    for slot, status, body, elapsed, attempts in sorted(
+        results, key=lambda item: item[0]
+    ):
+        if attempts:
+            _warn(
+                result,
+                f"slot {slot} retried {attempts} time(s) after a "
+                "llama-server generation error (known upstream issue, see "
+                "ggml-org/llama.cpp#26381)",
+            )
         if status != 200 or not isinstance(body, dict) or "error" in body:
             _fail(result, f"slot {slot} returned HTTP {status}: {body}")
             continue
@@ -718,6 +759,16 @@ def capacity_test(
             parallel_slots=target_parallel,
         )
         token_metrics.append(metric)
+        if (
+            not metric.estimated
+            and metric.generated_tokens is not None
+            and metric.generated_tokens < output_tokens
+        ):
+            _warn(
+                result,
+                f"slot {slot} stopped after {metric.generated_tokens} generated "
+                f"tokens before the {output_tokens}-token maximum",
+            )
         estimate_suffix = " (estimated)" if metric.estimated else ""
         _info(
             result,

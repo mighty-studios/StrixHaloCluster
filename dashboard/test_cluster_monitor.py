@@ -119,6 +119,175 @@ class DashboardCapacityTests(unittest.TestCase):
 
         self.assertEqual([slot["id"] for slot in selected], [0])
 
+    def test_capacity_request_honors_end_of_sequence(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        captured: list[dict[str, object]] = []
+        response = {
+            "tokens_evaluated": 3,
+            "truncated": False,
+            "timings": {
+                "prompt_n": 3,
+                "predicted_n": 2,
+                "prompt_ms": 3.0,
+                "predicted_ms": 2.0,
+            },
+        }
+
+        def fake_http_json(url: str, timeout: float) -> tuple[int, object]:
+            if url.endswith("/health"):
+                return 200, {"status": "ok"}
+            started.wait(timeout=1)
+            release.set()
+            return 200, [{"id": 0, "is_processing": True, "n_ctx": 101}]
+
+        def fake_post_json(
+            url: str, body: dict[str, object], timeout: float
+        ) -> tuple[int, object]:
+            captured.append(body)
+            started.set()
+            release.wait(timeout=1)
+            return 200, response
+
+        with (
+            patch.object(cluster_tests, "http_json", side_effect=fake_http_json),
+            patch.object(
+                cluster_tests, "_post_json", side_effect=fake_post_json
+            ),
+        ):
+            result = cluster_tests.capacity_test(
+                {
+                    "llama_url": "http://127.0.0.1:8081",
+                    "metrics_db": "",
+                },
+                context_tokens=101,
+                input_tokens=3,
+                output_tokens=2,
+                parallel=1,
+                record_metrics=False,
+            )
+
+        self.assertTrue(result.ok, result.render())
+        self.assertEqual(len(captured), 1)
+        self.assertFalse(captured[0]["ignore_eos"])
+        self.assertEqual(captured[0]["n_predict"], 2)
+
+    def test_capacity_retries_transient_generation_error(self) -> None:
+        generation_error = 500, {
+            "error": {
+                "code": 500,
+                "message": (
+                    "The model produced output that does not match the "
+                    "expected Content-only format"
+                ),
+                "type": "server_error",
+            }
+        }
+        success = 200, {
+            "tokens_evaluated": 3,
+            "truncated": False,
+            "timings": {
+                "prompt_n": 3,
+                "predicted_n": 2,
+                "prompt_ms": 3.0,
+                "predicted_ms": 2.0,
+            },
+        }
+        attempts: list[dict[str, object]] = []
+
+        def fake_http_json(url: str, timeout: float) -> tuple[int, object]:
+            if url.endswith("/health"):
+                return 200, {"status": "ok"}
+            return 200, [{"id": 0, "is_processing": True, "n_ctx": 101}]
+
+        def fake_post_json(
+            url: str, body: dict[str, object], timeout: float
+        ) -> tuple[int, object]:
+            attempts.append(body)
+            return generation_error if len(attempts) == 1 else success
+
+        with (
+            patch.object(cluster_tests, "http_json", side_effect=fake_http_json),
+            patch.object(
+                cluster_tests, "_post_json", side_effect=fake_post_json
+            ),
+        ):
+            result = cluster_tests.capacity_test(
+                {
+                    "llama_url": "http://127.0.0.1:8081",
+                    "metrics_db": "",
+                },
+                context_tokens=101,
+                input_tokens=3,
+                output_tokens=2,
+                parallel=1,
+                record_metrics=False,
+            )
+
+        self.assertTrue(result.ok, result.render())
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(
+            any("retried 1 time(s)" in line for line in result.lines),
+            result.render(),
+        )
+
+    def test_capacity_fails_after_exhausting_generation_error_retries(
+        self,
+    ) -> None:
+        generation_error = 500, {
+            "error": {
+                "code": 500,
+                "message": (
+                    "The model produced output that does not match the "
+                    "expected Content-only format"
+                ),
+                "type": "server_error",
+            }
+        }
+        attempts: list[dict[str, object]] = []
+
+        def fake_http_json(url: str, timeout: float) -> tuple[int, object]:
+            if url.endswith("/health"):
+                return 200, {"status": "ok"}
+            return 200, [{"id": 0, "is_processing": True, "n_ctx": 101}]
+
+        def fake_post_json(
+            url: str, body: dict[str, object], timeout: float
+        ) -> tuple[int, object]:
+            attempts.append(body)
+            return generation_error
+
+        with (
+            patch.object(cluster_tests, "http_json", side_effect=fake_http_json),
+            patch.object(
+                cluster_tests, "_post_json", side_effect=fake_post_json
+            ),
+        ):
+            result = cluster_tests.capacity_test(
+                {
+                    "llama_url": "http://127.0.0.1:8081",
+                    "metrics_db": "",
+                },
+                context_tokens=101,
+                input_tokens=3,
+                output_tokens=2,
+                parallel=1,
+                record_metrics=False,
+            )
+
+        self.assertFalse(result.ok, result.render())
+        self.assertEqual(
+            len(attempts), cluster_tests.CAPACITY_GENERATION_ERROR_RETRIES + 1
+        )
+        self.assertTrue(
+            any(
+                f"retried {cluster_tests.CAPACITY_GENERATION_ERROR_RETRIES} "
+                "time(s)" in line
+                for line in result.lines
+            ),
+            result.render(),
+        )
+
     def test_capacity_wrapper_accepts_runner_progress(self) -> None:
         app = cluster_dashboard.DashboardApp({})
 
