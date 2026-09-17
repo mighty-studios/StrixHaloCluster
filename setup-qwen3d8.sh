@@ -755,6 +755,27 @@ configure_ttm
 # =============================================================================
 # 5. LLAMA.CPP BUILD
 # =============================================================================
+# Vendored source patches applied to the pinned llama.cpp checkout; see
+# patches/README.md for what each one does and why. Reruns are safe: a patch
+# already applied is detected via its reverse-check and skipped.
+apply_llama_patches() {
+  local patch_dir="$SCRIPT_DIR/patches"
+  [ -d "$patch_dir" ] || return 0
+
+  local patch
+  for patch in "$patch_dir"/*.patch; do
+    [ -e "$patch" ] || continue
+    if git -C "$LLAMA_SRC" apply --check "$patch" 2>/dev/null; then
+      git -C "$LLAMA_SRC" apply "$patch"
+      ok "applied $(basename "$patch")"
+    elif git -C "$LLAMA_SRC" apply --reverse --check "$patch" 2>/dev/null; then
+      ok "$(basename "$patch") already applied"
+    else
+      die "$(basename "$patch") does not apply to llama.cpp commit $LLAMA_CPP_COMMIT; refresh the patch"
+    fi
+  done
+}
+
 build_llama_cpp() {
   [ "$BUILD_LLAMA_CPP" = "1" ] || return 0
 
@@ -773,6 +794,8 @@ build_llama_cpp() {
   actual_commit="$(git -C "$LLAMA_SRC" rev-parse HEAD)"
   [ "$actual_commit" = "$LLAMA_CPP_COMMIT" ] \
     || die "llama.cpp checkout is $actual_commit instead of $LLAMA_CPP_COMMIT"
+
+  apply_llama_patches
 
   unset GGML_CUDA_ENABLE_UNIFIED_MEMORY
   local hipconfig_bin

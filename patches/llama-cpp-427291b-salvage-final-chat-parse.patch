@@ -1,0 +1,38 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -3853,9 +3853,13 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+     auto result = parser.parse(ctx);
+ 
+     if (result.fail()) {
+-        // During partial parsing, return partial results if any AST nodes were captured
+-        // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
+-        if (is_partial && result.end > 0) {
++        // Salvage whatever was successfully parsed instead of hard-failing the
++        // request. Upstream only took this path for partial (streaming) parses;
++        // a generation glitch can make a final parse fail the same way by
++        // leaving trailing content the grammar does not expect (see
++        // ggml-org/llama.cpp#26381 and ggml-org/llama.cpp#20260), so a final
++        // parse is salvaged the same way instead of throwing a hard error.
++        if (result.end > 0) {
+             // Try to extract any partial results from what was successfully parsed
+             common_chat_msg msg;
+             msg.role = "assistant";
+@@ -3868,11 +3872,16 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
+                 mapper = std::make_unique<common_chat_peg_mapper>(msg);
+             }
+             mapper->from_ast(ctx.ast, result);
++            if (!is_partial && result.end < effective_input.size()) {
++                // Keep the unparsed tail visible instead of silently dropping it.
++                msg.content += effective_input.substr(result.end);
++            }
+ 
+             if (ctx.is_debug()) {
+-                fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
++                fprintf(stderr, "\nAST for %s parse (fail):\n%s\n", is_partial ? "partial" : "final", ctx.ast.dump().c_str());
+                 fflush(stderr);
+             }
++            LOG_WRN("%s: salvaged %s output after unparsed trailing content: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
+             return msg;
+         }
+         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
