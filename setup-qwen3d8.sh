@@ -756,8 +756,10 @@ configure_ttm
 # 5. LLAMA.CPP BUILD
 # =============================================================================
 # Vendored source patches applied to the pinned llama.cpp checkout; see
-# patches/README.md for what each one does and why. Reruns are safe: a patch
-# already applied is detected via its reverse-check and skipped.
+# patches/README.md for what each one does and why. build_llama_cpp resets the
+# checkout to the pristine pinned commit before calling this, so patches are
+# re-applied from a clean base on every run regardless of prior runs or edits
+# to the patch files themselves.
 apply_llama_patches() {
   local patch_dir="$SCRIPT_DIR/patches"
   [ -d "$patch_dir" ] || return 0
@@ -765,14 +767,9 @@ apply_llama_patches() {
   local patch
   for patch in "$patch_dir"/*.patch; do
     [ -e "$patch" ] || continue
-    if git -C "$LLAMA_SRC" apply --check "$patch" 2>/dev/null; then
-      git -C "$LLAMA_SRC" apply "$patch"
-      ok "applied $(basename "$patch")"
-    elif git -C "$LLAMA_SRC" apply --reverse --check "$patch" 2>/dev/null; then
-      ok "$(basename "$patch") already applied"
-    else
-      die "$(basename "$patch") does not apply to llama.cpp commit $LLAMA_CPP_COMMIT; refresh the patch"
-    fi
+    git -C "$LLAMA_SRC" apply "$patch" \
+      || die "$(basename "$patch") does not apply to llama.cpp commit $LLAMA_CPP_COMMIT; refresh the patch"
+    ok "applied $(basename "$patch")"
   done
 }
 
@@ -795,6 +792,10 @@ build_llama_cpp() {
   [ "$actual_commit" = "$LLAMA_CPP_COMMIT" ] \
     || die "llama.cpp checkout is $actual_commit instead of $LLAMA_CPP_COMMIT"
 
+  # Discard any changes from a previous run's patches before reapplying, so
+  # patch content can change across script versions without leaving the
+  # checkout in a stale, partially-patched state.
+  git -C "$LLAMA_SRC" reset --hard "$LLAMA_CPP_COMMIT"
   apply_llama_patches
 
   unset GGML_CUDA_ENABLE_UNIFIED_MEMORY
@@ -1314,8 +1315,11 @@ configure_runtime_firewall() {
 configure_runtime_firewall
 
 if [ "$NODE_ROLE" = "server" ] && [ "$REBOOT_REQUIRED" != "1" ]; then
-  systemctl start --no-block qwen3d8-server.service >/dev/null 2>&1 || true
-  ok "controller service started; it waits for RPC at $CLUSTER_PEER_IP:$RPC_PORT"
+  # Always restart, not just start: a rerun can follow a fresh llama-server
+  # build (patches, a bumped LLAMA_CPP_COMMIT, or changed flags), and an
+  # already-running service must reload to actually use the new binary.
+  systemctl restart --no-block qwen3d8-server.service >/dev/null 2>&1 || true
+  ok "controller service (re)started; it waits for RPC at $CLUSTER_PEER_IP:$RPC_PORT"
 fi
 
 echo

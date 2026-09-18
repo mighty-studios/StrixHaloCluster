@@ -119,7 +119,7 @@ before using the extended window in production.
 - XRDP redirected Windows drives: `~/thinclient_drives` inside the remote session
 - SSH: `<node>:22` (OpenSSH server, installed and enabled by `setup-environment.sh`)
 
-All scripts are designed to be rerun safely. Use `--help` for the complete option list, review any `Action required` messages, and use `sudo qwen3d8-status` or `sudo usb4-cluster-status` for diagnostics.
+All scripts are designed to be rerun safely. Use `--help` for the complete option list, review any `Action required` messages, and use `sudo qwen3d8-status` or `sudo usb4-cluster-status` for diagnostics. Rerunning `setup-qwen3d8.sh` on the server restarts the controller service so it always picks up a freshly rebuilt `llama-server` (for example after a vendored patch or commit update); this briefly interrupts any active inference.
 
 The dashboard is maintained separately from the provisioning scripts. See
 [`dashboard/README.md`](dashboard/README.md) for its installation, telemetry

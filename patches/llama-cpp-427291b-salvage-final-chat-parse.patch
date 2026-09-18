@@ -1,38 +1,42 @@
+warning: in the working copy of 'chat.cpp.orig', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'chat.cpp.patched', LF will be replaced by CRLF the next time Git touches it
 diff --git a/common/chat.cpp b/common/chat.cpp
 --- a/common/chat.cpp
 +++ b/common/chat.cpp
-@@ -3853,9 +3853,13 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
-     auto result = parser.parse(ctx);
- 
-     if (result.fail()) {
--        // During partial parsing, return partial results if any AST nodes were captured
--        // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
--        if (is_partial && result.end > 0) {
-+        // Salvage whatever was successfully parsed instead of hard-failing the
-+        // request. Upstream only took this path for partial (streaming) parses;
-+        // a generation glitch can make a final parse fail the same way by
-+        // leaving trailing content the grammar does not expect (see
-+        // ggml-org/llama.cpp#26381 and ggml-org/llama.cpp#20260), so a final
-+        // parse is salvaged the same way instead of throwing a hard error.
-+        if (result.end > 0) {
-             // Try to extract any partial results from what was successfully parsed
-             common_chat_msg msg;
-             msg.role = "assistant";
-@@ -3868,11 +3872,16 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
-                 mapper = std::make_unique<common_chat_peg_mapper>(msg);
-             }
-             mapper->from_ast(ctx.ast, result);
-+            if (!is_partial && result.end < effective_input.size()) {
-+                // Keep the unparsed tail visible instead of silently dropping it.
-+                msg.content += effective_input.substr(result.end);
-+            }
- 
-             if (ctx.is_debug()) {
--                fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
-+                fprintf(stderr, "\nAST for %s parse (fail):\n%s\n", is_partial ? "partial" : "final", ctx.ast.dump().c_str());
-                 fflush(stderr);
-             }
-+            LOG_WRN("%s: salvaged %s output after unparsed trailing content: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
+@@ -3876,6 +3876,36 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
              return msg;
          }
          LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
++        // A generation glitch (see ggml-org/llama.cpp#26381 and
++        // ggml-org/llama.cpp#20260) can leave a *final* (non-streaming) parse
++        // unable to match the grammar anywhere at all, from the very first
++        // byte onward, not just trailing off partway through. Salvage a final
++        // parse unconditionally instead of throwing: return whatever the AST
++        // captured (possibly nothing) plus the unparsed remainder as literal
++        // content, so a corrupted generation degrades the response instead of
++        // failing the request outright.
++        if (!is_partial) {
++            common_chat_msg msg;
++            msg.role = "assistant";
++            std::unique_ptr<common_chat_peg_mapper> mapper;
++            if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
++                mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
++            } else if (params.format == COMMON_CHAT_FORMAT_PEG_MINIMAX_M3) {
++                mapper = std::make_unique<common_chat_peg_minimax_m3_mapper>(msg);
++            } else {
++                mapper = std::make_unique<common_chat_peg_mapper>(msg);
++            }
++            mapper->from_ast(ctx.ast, result);
++            if (result.end < effective_input.size()) {
++                msg.content += effective_input.substr(result.end);
++            }
++
++            if (ctx.is_debug()) {
++                fprintf(stderr, "\nAST for final parse (fail):\n%s\n", ctx.ast.dump().c_str());
++                fflush(stderr);
++            }
++            return msg;
++        }
+         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
+         throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
+     }
